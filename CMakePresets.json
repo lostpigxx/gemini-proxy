@@ -1,0 +1,62 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "VKP_USE_MIMALLOC": "ON"
+      }
+    },
+    {
+      "name": "asan-ubsan",
+      "displayName": "Debug + ASan/UBSan",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VKP_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Debug + TSan",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "VKP_SANITIZE": "thread"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan-ubsan", "configurePreset": "asan-ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" }
+  ],
+  "testPresets": [
+    {
+      "name": "base-test",
+      "hidden": true,
+      "output": { "outputOnFailure": true }
+    },
+    { "name": "debug", "inherits": "base-test", "configurePreset": "debug" },
+    { "name": "release", "inherits": "base-test", "configurePreset": "release" },
+    { "name": "asan-ubsan", "inherits": "base-test", "configurePreset": "asan-ubsan" },
+    { "name": "tsan", "inherits": "base-test", "configurePreset": "tsan" }
+  ]
+}

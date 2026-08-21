@@ -1,0 +1,16 @@
+Checks: >
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-special-member-functions,
+  misc-*,
+  -modernize-use-trailing-return-type,
+  -misc-non-private-member-variables-in-classes,
+  -misc-include-cleaner,
+  -bugprone-easily-swappable-parameters
+WarningsAsErrors: ''
+HeaderFilterRegex: '(src|tests|benchmarks|fuzz)/.*\.hpp$'
+FormatStyle: file

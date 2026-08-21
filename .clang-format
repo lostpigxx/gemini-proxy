@@ -1,0 +1,16 @@
+# Project style: Google base, 100 columns, left-aligned pointers.
+BasedOnStyle: Google
+ColumnLimit: 100
+IndentWidth: 2
+PointerAlignment: Left
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: Inline
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Project headers (quoted) get priority 3 via the default; groups below order system/deps.
+  - Regex: '^<(fmt|quill|CLI|toml\+\+|catch2|nanobench|xxhash|liburing)'
+    Priority: 2
+  - Regex: '^<'
+    Priority: 1
+  - Regex: '^"'
+    Priority: 3

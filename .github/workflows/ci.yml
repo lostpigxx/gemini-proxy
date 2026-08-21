@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+      - name: Check formatting
+        run: |
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
+          ./scripts/format.sh --check
+
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: gcc-14 debug,        cc: gcc-14,   cxx: g++-14,     preset: debug }
+          - { name: gcc-14 release,      cc: gcc-14,   cxx: g++-14,     preset: release }
+          - { name: clang-20 debug,      cc: clang-20, cxx: clang++-20, preset: debug }
+          - { name: clang-20 release,    cc: clang-20, cxx: clang++-20, preset: release }
+          - { name: clang-20 asan-ubsan, cc: clang-20, cxx: clang++-20, preset: asan-ubsan }
+          - { name: clang-20 tsan,       cc: clang-20, cxx: clang++-20, preset: tsan }
+    name: linux / ${{ matrix.name }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install base tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build liburing-dev gcc-14 g++-14
+      - name: Install clang-20
+        if: startsWith(matrix.cc, 'clang')
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+      - name: Cache CPM sources
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/CPM
+          key: cpm-${{ hashFiles('cmake/Dependencies.cmake') }}
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DVKP_WERROR=ON -DCPM_SOURCE_CACHE=~/.cache/CPM
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }}
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }}
+      - name: Run proxyd smoke
+        run: ./build/${{ matrix.preset }}/src/proxyd --version
+
+  macos:
+    runs-on: macos-15
+    name: macos / kqueue path
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: brew install ninja
+      - name: Cache CPM sources
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/CPM
+          key: cpm-macos-${{ hashFiles('cmake/Dependencies.cmake') }}
+      - name: Configure
+        run: cmake --preset debug -DVKP_WERROR=ON -DCPM_SOURCE_CACHE=~/.cache/CPM
+      - name: Build
+        run: cmake --build --preset debug
+      - name: Test
+        run: ctest --preset debug
+      - name: Run proxyd smoke
+        run: ./build/debug/src/proxyd --version
