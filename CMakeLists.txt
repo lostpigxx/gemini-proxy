@@ -8,6 +8,9 @@ project(valkey-proxy
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# No C++20 modules (docs/architecture-decisions.md §3.3); skipping the scan
+# also drops the clang-scan-deps requirement on minimal toolchains.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VKP_WERROR "Treat warnings as errors" OFF)

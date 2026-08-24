@@ -54,6 +54,35 @@ jobs:
       - name: Run proxyd smoke
         run: ./build/${{ matrix.preset }}/src/proxyd --version
 
+  fuzz:
+    runs-on: ubuntu-24.04
+    name: fuzz / resp parser (60s)
+    env:
+      CC: clang-20
+      CXX: clang++-20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install base tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install clang-20
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 20
+      - name: Cache CPM sources
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/CPM
+          key: cpm-${{ hashFiles('cmake/Dependencies.cmake') }}
+      - name: Configure
+        run: >
+          cmake --preset asan-ubsan -DVKP_WERROR=ON -DCPM_SOURCE_CACHE=~/.cache/CPM
+          -DVKP_BUILD_FUZZERS=ON -DVKP_BUILD_TESTS=OFF -DVKP_BUILD_BENCHMARKS=OFF
+      - name: Build fuzzer
+        run: cmake --build --preset asan-ubsan --target resp_parser_fuzz
+      - name: Fuzz for 60 seconds
+        run: >
+          ./build/asan-ubsan/fuzz/resp_parser_fuzz
+          -max_total_time=60 -rss_limit_mb=2048 -print_final_stats=1 fuzz/corpus
+
   macos:
     runs-on: macos-15
     name: macos / kqueue path
