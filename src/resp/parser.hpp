@@ -21,18 +21,18 @@ enum class parse_status : std::uint8_t {
 
 enum class parse_errc : std::uint8_t {
   none = 0,
-  unknown_type_byte,        // unrecognized type byte (includes inline commands, TODO)
-  bare_lf,                  // '\n' not preceded by '\r'
-  bad_integer,              // malformed integer / length line
-  length_out_of_range,      // negative length where not allowed, or over limit
-  line_too_long,            // header line exceeds max_line_bytes
-  message_too_large,        // message exceeds max_message_bytes
-  nesting_too_deep,         // aggregate nesting exceeds max_nesting_depth
-  missing_bulk_crlf,        // bulk payload not terminated by CRLF
-  invalid_boolean,          // '#' line other than "t"/"f"
-  invalid_null,             // '_' line not empty
-  empty_scalar,             // ','/'(' with empty content
-  streamed_not_supported,   // RESP3 streamed/chunked types
+  unknown_type_byte,       // unrecognized type byte (includes inline commands, TODO)
+  bare_lf,                 // '\n' not preceded by '\r'
+  bad_integer,             // malformed integer / length line
+  length_out_of_range,     // negative length where not allowed, or over limit
+  line_too_long,           // header line exceeds max_line_bytes
+  message_too_large,       // message exceeds max_message_bytes
+  nesting_too_deep,        // aggregate nesting exceeds max_nesting_depth
+  missing_bulk_crlf,       // bulk payload not terminated by CRLF
+  invalid_boolean,         // '#' line other than "t"/"f"
+  invalid_null,            // '_' line not empty
+  empty_scalar,            // ','/'(' with empty content
+  streamed_not_supported,  // RESP3 streamed/chunked types
   // Deep parser (resp::parse_tree) only:
   trailing_bytes,   // bytes left over after the single expected value
   truncated_frame,  // frame ended mid-value (caller violated the contract)

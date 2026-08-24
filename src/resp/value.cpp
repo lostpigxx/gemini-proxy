@@ -3,10 +3,10 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
-#include <expected>
 #include <optional>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace vkp::resp {
 
@@ -34,209 +34,217 @@ std::optional<double> parse_f64(std::string_view s) {
   return v;
 }
 
+// Error-code style throughout (fill the out-param, return parse_errc::none on
+// success); the public API wraps the root into tree_result.
 class tree_reader {
  public:
   tree_reader(std::string_view frame, const limits& lim) : frame_(frame), limits_(lim) {}
 
-  std::expected<value, parse_errc> read() {
-    auto root = read_value(0);
-    if (root && pos_ != frame_.size()) {
-      return std::unexpected(parse_errc::trailing_bytes);
+  parse_errc read(value& out) {
+    const parse_errc err = read_value(0, out);
+    if (err == parse_errc::none && pos_ != frame_.size()) {
+      return parse_errc::trailing_bytes;
     }
-    return root;
+    return err;
   }
 
  private:
-  using result = std::expected<value, parse_errc>;
-
-  result read_value(std::uint32_t depth) {
+  parse_errc read_value(std::uint32_t depth, value& out) {
     // An attribute may precede any value; it annotates the value that follows.
     std::vector<value> attributes;
     while (true) {
-      auto line = read_line();
-      if (!line) {
-        return std::unexpected(line.error());
+      std::string_view line;
+      if (const parse_errc err = read_line(line); err != parse_errc::none) {
+        return err;
       }
-      if (line->empty()) {
-        return std::unexpected(parse_errc::unknown_type_byte);
+      if (line.empty()) {
+        return parse_errc::unknown_type_byte;
       }
-      const char type = line->front();
-      const std::string_view rest = line->substr(1);
+      const char type = line.front();
+      const std::string_view rest = line.substr(1);
       if (type == '|') {
+        if (rest == "?") {
+          return parse_errc::streamed_not_supported;
+        }
+        const auto n = parse_i64(rest);
+        if (!n) {
+          return parse_errc::bad_integer;
+        }
+        if (*n < 0) {
+          return parse_errc::length_out_of_range;
+        }
         if (depth >= limits_.max_nesting_depth) {
-          return std::unexpected(parse_errc::nesting_too_deep);
+          return parse_errc::nesting_too_deep;
         }
-        auto pairs = read_children(rest, 2, depth + 1);
-        if (!pairs) {
-          return std::unexpected(pairs.error());
+        if (const parse_errc err =
+                read_children(static_cast<std::uint64_t>(*n) * 2, depth + 1, attributes);
+            err != parse_errc::none) {
+          return err;
         }
-        attributes = std::move(*pairs);
         continue;  // the annotated value follows
       }
-      auto v = read_typed_value(type, rest, depth);
-      if (v) {
-        v->attributes = std::move(attributes);
+      const parse_errc err = read_typed_value(type, rest, depth, out);
+      if (err == parse_errc::none) {
+        out.attributes = std::move(attributes);
       }
-      return v;
+      return err;
     }
   }
 
-  result read_typed_value(char type, std::string_view rest, std::uint32_t depth) {
-    value v;
+  parse_errc read_typed_value(char type, std::string_view rest, std::uint32_t depth, value& out) {
     switch (type) {
       case '+':
-        v.type = value::kind::simple_string;
-        v.text = rest;
-        return v;
+        out.type = value::kind::simple_string;
+        out.text = rest;
+        return parse_errc::none;
       case '-':
-        v.type = value::kind::error;
-        v.text = rest;
-        return v;
+        out.type = value::kind::error;
+        out.text = rest;
+        return parse_errc::none;
       case ':': {
         const auto n = parse_i64(rest);
         if (!n) {
-          return std::unexpected(parse_errc::bad_integer);
+          return parse_errc::bad_integer;
         }
-        v.type = value::kind::integer;
-        v.integer = *n;
-        return v;
+        out.type = value::kind::integer;
+        out.integer = *n;
+        return parse_errc::none;
       }
       case ',': {
         const auto d = parse_f64(rest);
         if (!d) {
-          return std::unexpected(parse_errc::bad_double);
+          return parse_errc::bad_double;
         }
-        v.type = value::kind::double_number;
-        v.number = *d;
-        return v;
+        out.type = value::kind::double_number;
+        out.number = *d;
+        return parse_errc::none;
       }
       case '#':
         if (rest != "t" && rest != "f") {
-          return std::unexpected(parse_errc::invalid_boolean);
+          return parse_errc::invalid_boolean;
         }
-        v.type = value::kind::boolean;
-        v.boolean = rest == "t";
-        return v;
+        out.type = value::kind::boolean;
+        out.boolean = rest == "t";
+        return parse_errc::none;
       case '(':
         if (rest.empty()) {
-          return std::unexpected(parse_errc::empty_scalar);
+          return parse_errc::empty_scalar;
         }
-        v.type = value::kind::big_number;
-        v.text = rest;
-        return v;
+        out.type = value::kind::big_number;
+        out.text = rest;
+        return parse_errc::none;
       case '_':
         if (!rest.empty()) {
-          return std::unexpected(parse_errc::invalid_null);
+          return parse_errc::invalid_null;
         }
-        v.type = value::kind::null;
-        return v;
+        out.type = value::kind::null;
+        return parse_errc::none;
       case '$':
       case '=': {
         const auto n = parse_i64(rest);
         if (!n) {
-          return std::unexpected(parse_errc::bad_integer);
+          return parse_errc::bad_integer;
         }
         if (*n == -1 && type == '$') {
-          v.type = value::kind::null;
-          return v;
+          out.type = value::kind::null;
+          return parse_errc::none;
         }
         if (*n < 0 || static_cast<std::uint64_t>(*n) > limits_.max_bulk_bytes) {
-          return std::unexpected(parse_errc::length_out_of_range);
+          return parse_errc::length_out_of_range;
         }
         const auto length = static_cast<std::size_t>(*n);
         if (frame_.size() - pos_ < length + 2) {
-          return std::unexpected(parse_errc::truncated_frame);
+          return parse_errc::truncated_frame;
         }
         if (frame_[pos_ + length] != '\r' || frame_[pos_ + length + 1] != '\n') {
-          return std::unexpected(parse_errc::missing_bulk_crlf);
+          return parse_errc::missing_bulk_crlf;
         }
-        v.type = type == '$' ? value::kind::bulk_string : value::kind::verbatim_string;
-        v.text = frame_.substr(pos_, length);
+        out.type = type == '$' ? value::kind::bulk_string : value::kind::verbatim_string;
+        out.text = frame_.substr(pos_, length);
         pos_ += length + 2;
-        return v;
+        return parse_errc::none;
       }
       case '*':
       case '%':
       case '~':
       case '>': {
-        if (type == '*' && rest == "-1") {
-          v.type = value::kind::null;
-          return v;
+        if (rest == "?") {
+          return parse_errc::streamed_not_supported;
+        }
+        const auto n = parse_i64(rest);
+        if (!n) {
+          return parse_errc::bad_integer;
+        }
+        // Compare the parsed value, not the text: the shallow parser accepts
+        // non-canonical spellings like "*-01" as a null array, and the two
+        // parsers must agree on every frame (fuzzer-found divergence).
+        if (type == '*' && *n == -1) {
+          out.type = value::kind::null;
+          return parse_errc::none;
+        }
+        if (*n < 0) {
+          return parse_errc::length_out_of_range;
         }
         if (depth >= limits_.max_nesting_depth) {
-          return std::unexpected(parse_errc::nesting_too_deep);
+          return parse_errc::nesting_too_deep;
         }
         const std::uint64_t multiplier = type == '%' ? 2 : 1;
-        auto children = read_children(rest, multiplier, depth + 1);
-        if (!children) {
-          return std::unexpected(children.error());
+        if (const parse_errc err =
+                read_children(static_cast<std::uint64_t>(*n) * multiplier, depth + 1, out.elements);
+            err != parse_errc::none) {
+          return err;
         }
         switch (type) {
           case '*':
-            v.type = value::kind::array;
+            out.type = value::kind::array;
             break;
           case '%':
-            v.type = value::kind::map;
+            out.type = value::kind::map;
             break;
           case '~':
-            v.type = value::kind::set;
+            out.type = value::kind::set;
             break;
           default:
-            v.type = value::kind::push;
+            out.type = value::kind::push;
             break;
         }
-        v.elements = std::move(*children);
-        return v;
+        return parse_errc::none;
       }
       default:
-        return std::unexpected(parse_errc::unknown_type_byte);
+        return parse_errc::unknown_type_byte;
     }
   }
 
-  std::expected<std::vector<value>, parse_errc> read_children(std::string_view count_line,
-                                                              std::uint64_t multiplier,
-                                                              std::uint32_t depth) {
-    if (count_line == "?") {
-      return std::unexpected(parse_errc::streamed_not_supported);
-    }
-    const auto n = parse_i64(count_line);
-    if (!n) {
-      return std::unexpected(parse_errc::bad_integer);
-    }
-    if (*n < 0) {
-      return std::unexpected(parse_errc::length_out_of_range);
-    }
-    const std::uint64_t total = static_cast<std::uint64_t>(*n) * multiplier;
-    std::vector<value> children;
+  parse_errc read_children(std::uint64_t total, std::uint32_t depth, std::vector<value>& out) {
     // Every value is >= 3 bytes ("_\r\n"), so the frame size bounds any honest
     // count; a lying count fails on truncated_frame before allocating much.
-    children.reserve(static_cast<std::size_t>(
-        std::min<std::uint64_t>(total, (frame_.size() - pos_) / 3 + 1)));
+    out.reserve(
+        static_cast<std::size_t>(std::min<std::uint64_t>(total, (frame_.size() - pos_) / 3 + 1)));
     for (std::uint64_t i = 0; i < total; ++i) {
-      auto child = read_value(depth);
-      if (!child) {
-        return std::unexpected(child.error());
+      value child;
+      if (const parse_errc err = read_value(depth, child); err != parse_errc::none) {
+        return err;
       }
-      children.push_back(std::move(*child));
+      out.push_back(std::move(child));
     }
-    return children;
+    return parse_errc::none;
   }
 
   // Consumes one "...\r\n" line and returns its content (without CRLF).
-  std::expected<std::string_view, parse_errc> read_line() {
+  parse_errc read_line(std::string_view& out) {
     const std::size_t nl = frame_.find('\n', pos_);
     if (nl == std::string_view::npos) {
-      return std::unexpected(parse_errc::truncated_frame);
+      return parse_errc::truncated_frame;
     }
     if (nl == pos_ || frame_[nl - 1] != '\r') {
-      return std::unexpected(parse_errc::bare_lf);
+      return parse_errc::bare_lf;
     }
     if (nl - 1 - pos_ > limits_.max_line_bytes) {
-      return std::unexpected(parse_errc::line_too_long);
+      return parse_errc::line_too_long;
     }
-    const std::string_view line = frame_.substr(pos_, nl - 1 - pos_);
+    out = frame_.substr(pos_, nl - 1 - pos_);
     pos_ = nl + 1;
-    return line;
+    return parse_errc::none;
   }
 
   std::string_view frame_;
@@ -246,11 +254,15 @@ class tree_reader {
 
 }  // namespace
 
-std::expected<value, parse_errc> parse_tree(std::string_view frame, const limits& lim) {
+tree_result parse_tree(std::string_view frame, const limits& lim) {
   if (frame.size() > lim.max_message_bytes) {
-    return std::unexpected(parse_errc::message_too_large);
+    return parse_errc::message_too_large;
   }
-  return tree_reader(frame, lim).read();
+  value root;
+  if (const parse_errc err = tree_reader(frame, lim).read(root); err != parse_errc::none) {
+    return err;
+  }
+  return root;
 }
 
 }  // namespace vkp::resp

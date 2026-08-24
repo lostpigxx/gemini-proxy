@@ -1,10 +1,10 @@
-#include <catch2/catch_test_macros.hpp>
+#include "core/buffer.hpp"
 
 #include <cstring>
 #include <string>
 #include <string_view>
 
-#include "core/buffer.hpp"
+#include <catch2/catch_test_macros.hpp>
 
 using vkp::read_buffer;
 

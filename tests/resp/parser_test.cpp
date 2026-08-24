@@ -1,13 +1,14 @@
-#include <catch2/catch_test_macros.hpp>
+#include "resp/parser.hpp"
 
 #include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include <catch2/catch_test_macros.hpp>
+
 #include "core/buffer.hpp"
 #include "resp/limits.hpp"
-#include "resp/parser.hpp"
 
 using vkp::resp::limits;
 using vkp::resp::parse_errc;
@@ -133,10 +134,10 @@ TEST_CASE("non-command frames are complete but flagged", "[resp][parser]") {
   expect_not_command("+OK\r\n");
   expect_not_command("*0\r\n");
   expect_not_command("*-1\r\n");
-  expect_not_command("*2\r\n$3\r\nfoo\r\n:1\r\n");     // integer element
-  expect_not_command("*1\r\n$-1\r\n");                 // null bulk element
-  expect_not_command("*1\r\n=5\r\ntxt:x\r\n");         // verbatim element
-  expect_not_command("*1\r\n*1\r\n$4\r\nPING\r\n");    // nested array
+  expect_not_command("*2\r\n$3\r\nfoo\r\n:1\r\n");            // integer element
+  expect_not_command("*1\r\n$-1\r\n");                        // null bulk element
+  expect_not_command("*1\r\n=5\r\ntxt:x\r\n");                // verbatim element
+  expect_not_command("*1\r\n*1\r\n$4\r\nPING\r\n");           // nested array
   expect_not_command("|1\r\n+k\r\n+v\r\n*1\r\n$1\r\nx\r\n");  // attribute prefix
 }
 
@@ -264,8 +265,7 @@ TEST_CASE("protocol errors are sticky until reset", "[resp][parser]") {
   REQUIRE(p.parse("+OK\r\n") == parse_status::complete);
 }
 
-TEST_CASE("huge declared aggregate count waits for data, then trips size cap",
-          "[resp][parser]") {
+TEST_CASE("huge declared aggregate count waits for data, then trips size cap", "[resp][parser]") {
   limits lim;
   lim.max_message_bytes = 64;
   parser p(lim);

@@ -1,12 +1,13 @@
-#include <catch2/catch_test_macros.hpp>
+#include "resp/value.hpp"
 
 #include <cmath>
 #include <string>
 #include <string_view>
 
+#include <catch2/catch_test_macros.hpp>
+
 #include "resp/limits.hpp"
 #include "resp/parser.hpp"
-#include "resp/value.hpp"
 
 using vkp::resp::limits;
 using vkp::resp::parse_errc;
@@ -53,6 +54,12 @@ TEST_CASE("deep parse of scalar types", "[resp][value]") {
     REQUIRE(parse_tree("_\r\n")->type == value::kind::null);
     REQUIRE(parse_tree("$-1\r\n")->type == value::kind::null);
     REQUIRE(parse_tree("*-1\r\n")->type == value::kind::null);
+  }
+  SECTION("non-canonical -01 lengths agree with the shallow parser (fuzzer regression)") {
+    // The shallow parser judges null-ness by parsed value, so "-01" == -1;
+    // the deep parser must not diverge by comparing the raw text.
+    REQUIRE(parse_tree("*-01\r\n")->type == value::kind::null);
+    REQUIRE(parse_tree("$-01\r\n")->type == value::kind::null);
   }
   SECTION("bulk and verbatim") {
     const auto b = parse_tree("$5\r\nhello\r\n");

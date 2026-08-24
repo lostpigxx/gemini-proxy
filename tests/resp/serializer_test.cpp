@@ -1,10 +1,10 @@
-#include <catch2/catch_test_macros.hpp>
+#include "resp/serializer.hpp"
 
 #include <cstdint>
 #include <limits>
 #include <string>
 
-#include "resp/serializer.hpp"
+#include <catch2/catch_test_macros.hpp>
 
 using namespace vkp::resp;
 

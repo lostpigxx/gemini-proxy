@@ -173,8 +173,8 @@ parse_status parser::dispatch_header(std::string_view window, std::size_t line_e
       }
       return value_done();
 
-    case '$':  // bulk string
-    case '=': {// verbatim string
+    case '$':    // bulk string
+    case '=': {  // verbatim string
       if (rest == "?") {
         return fail(parse_errc::streamed_not_supported);
       }
@@ -203,11 +203,11 @@ parse_status parser::dispatch_header(std::string_view window, std::size_t line_e
       return parse_status::need_more;
     }
 
-    case '*':  // array
-    case '%':  // map
-    case '~':  // set
-    case '>':  // push
-    case '|': {// attribute
+    case '*':    // array
+    case '%':    // map
+    case '~':    // set
+    case '>':    // push
+    case '|': {  // attribute
       if (rest == "?") {
         return fail(parse_errc::streamed_not_supported);
       }
