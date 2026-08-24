@@ -14,6 +14,7 @@ option(VKP_WERROR "Treat warnings as errors" OFF)
 option(VKP_USE_MIMALLOC "Link mimalloc as the global allocator" OFF)
 option(VKP_BUILD_TESTS "Build unit tests" ON)
 option(VKP_BUILD_BENCHMARKS "Build micro benchmarks" ON)
+option(VKP_BUILD_FUZZERS "Build libFuzzer targets (requires clang with libFuzzer runtime)" OFF)
 set(VKP_SANITIZE "" CACHE STRING "Sanitizers to enable, e.g. 'address,undefined' or 'thread'")
 
 if(VKP_SANITIZE)
@@ -40,4 +41,8 @@ endif()
 
 if(VKP_BUILD_BENCHMARKS)
   add_subdirectory(benchmarks)
+endif()
+
+if(VKP_BUILD_FUZZERS)
+  add_subdirectory(fuzz)
 endif()
