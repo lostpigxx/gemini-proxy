@@ -9,3 +9,13 @@ target_link_libraries(vkp_bench
     fmt::fmt
     xxHash::xxhash
 )
+
+add_executable(vkp_resp_bench
+  resp_bench.cpp
+)
+target_link_libraries(vkp_resp_bench
+  PRIVATE
+    vkp_options
+    vkp_lib
+    nanobench
+)
