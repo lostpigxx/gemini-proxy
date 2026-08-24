@@ -12,7 +12,6 @@ int main() {
       .title("M0 smoke")
       .run("xxh3_64 of a redis-style key",
            [&] { ankerl::nanobench::doNotOptimizeAway(XXH3_64bits(key.data(), key.size())); })
-      .run("fmt::format small string", [&] {
-        ankerl::nanobench::doNotOptimizeAway(fmt::format("slot for {} computed", key));
-      });
+      .run("fmt::format small string",
+           [&] { ankerl::nanobench::doNotOptimizeAway(fmt::format("slot for {} computed", key)); });
 }

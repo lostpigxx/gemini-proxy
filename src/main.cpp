@@ -15,8 +15,7 @@ int main(int argc, char** argv) {
   app.set_version_flag("--version", std::string{vkp::kVersion});
 
   std::string config_path;
-  app.add_option("-c,--config", config_path, "Path to TOML config file")
-      ->check(CLI::ExistingFile);
+  app.add_option("-c,--config", config_path, "Path to TOML config file")->check(CLI::ExistingFile);
 
   CLI11_PARSE(app, argc, argv);
 

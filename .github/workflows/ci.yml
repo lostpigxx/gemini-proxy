@@ -10,12 +10,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # Version must match REQUIRED_VERSION in scripts/format.sh.
       - name: Install clang-format
-        run: sudo apt-get update && sudo apt-get install -y clang-format-18
+        run: pipx install "clang-format==20.1.8"
       - name: Check formatting
-        run: |
-          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
-          ./scripts/format.sh --check
+        run: ./scripts/format.sh --check
 
   linux:
     runs-on: ubuntu-24.04
