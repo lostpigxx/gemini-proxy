@@ -13,9 +13,9 @@
 
 ## 总览
 
-| 里程碑 | 主题 | 核心产物 |
-|---|---|---|
-| M0 | 工程骨架 | 可构建、可测试、CI 全绿的空项目 |
+| 里程碑 | 主题 | 核心产物 | 状态 |
+|---|---|---|---|
+| M0 | 工程骨架 | 可构建、可测试、CI 全绿的空项目 | ✅ 完成（2026-08-24, `9b19060`） |
 | M1 | RESP 协议解析器 | 经 fuzz 验证的零拷贝 RESP2/3 解析与序列化库 |
 | M2 | 事件循环 + 最小可用 proxy | `valkey-cli` 可通过 proxy 访问单个后端 |
 | M3 | 多线程 + 连接池 + pipelining | 可承受多连接压测的生产形态骨架 |
@@ -27,7 +27,9 @@
 
 ---
 
-## M0 — 工程骨架
+## M0 — 工程骨架 ✅
+
+**状态**：已完成（2026-08-24，`9b19060`），CI 8 个 job 全绿。
 
 **目标**：定下项目的质量下限。之后所有代码都在这套约束下开发。
 
@@ -54,6 +56,14 @@
 6. **打通验证**：一个最小 `proxyd` 可执行文件（打印版本退出）+ 一个最小 Catch2 测试 + 一个最小 nanobench 基准，证明全链路可用。
 
 **验收标准**：CI 全绿；macOS 本机与 Linux（容器）均可一条命令构建并跑测试。
+
+**实施记录（与计划的偏差）**：
+
+- CMake 选项统一用 `VKP_` 前缀（非计划中的 `PROXY_`）：`VKP_USE_MIMALLOC` / `VKP_SANITIZE` / `VKP_WERROR` / `VKP_BUILD_TESTS` / `VKP_BUILD_BENCHMARKS`。mimalloc 通过 `release` preset 开启。
+- CI 的 GCC 用 14 而非计划写的 15（ubuntu-24.04 上 gcc-14 可直接 apt 安装，gcc-15 需额外 PPA；基线本就是 GCC 14+）。
+- 警告选项挂在 `vkp_options` INTERFACE target 上，只作用于自有代码，第三方依赖不受 `-Werror` 影响。
+- xxHash 以 header-only（`XXH_INLINE_ALL`）方式消费，绕过其滞后的构建系统。
+- clang-format 版本 pin 到 20.1.8，本地与 CI 均通过 PyPI 包安装；`scripts/format.sh` 会校验二进制存在性与主版本号（早期版本会在工具缺失时静默通过，已修）。
 
 ---
 
