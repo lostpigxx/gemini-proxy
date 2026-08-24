@@ -225,9 +225,15 @@ TEST_CASE("defensive limits trip", "[resp][parser]") {
     limits lim;
     lim.max_nesting_depth = 4;
     REQUIRE(error_of("*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n:1\r\n", lim) == parse_errc::nesting_too_deep);
+    REQUIRE(error_of("*1\r\n*1\r\n*1\r\n*1\r\n|1\r\n+k\r\n+v\r\n:1\r\n", lim) ==
+            parse_errc::nesting_too_deep);
     // Exactly at the limit is fine.
     parser p(lim);
     REQUIRE(p.parse("*1\r\n*1\r\n*1\r\n*1\r\n:1\r\n") == parse_status::complete);
+    // Empty aggregates never descend, so they are exempt at any depth (must
+    // stay in sync with the deep parser — fuzzer-found divergence).
+    REQUIRE(p.parse("*1\r\n*1\r\n*1\r\n*1\r\n*0\r\n") == parse_status::complete);
+    REQUIRE(p.parse("*1\r\n*1\r\n*1\r\n*1\r\n|0\r\n:1\r\n") == parse_status::complete);
   }
   SECTION("single bulk size, rejected at the header") {
     limits lim;

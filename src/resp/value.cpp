@@ -73,7 +73,10 @@ class tree_reader {
         if (*n < 0) {
           return parse_errc::length_out_of_range;
         }
-        if (depth >= limits_.max_nesting_depth) {
+        // The depth limit only guards actual descent; empty aggregates never
+        // recurse and the shallow parser accepts them at any depth (the two
+        // parsers must agree on every frame, fuzzer-found divergence #2).
+        if (*n > 0 && depth >= limits_.max_nesting_depth) {
           return parse_errc::nesting_too_deep;
         }
         if (const parse_errc err =
@@ -185,12 +188,13 @@ class tree_reader {
         if (*n < 0) {
           return parse_errc::length_out_of_range;
         }
-        if (depth >= limits_.max_nesting_depth) {
+        const std::uint64_t multiplier = type == '%' ? 2 : 1;
+        const std::uint64_t total = static_cast<std::uint64_t>(*n) * multiplier;
+        // Empty aggregates never recurse: see the '|' branch above.
+        if (total > 0 && depth >= limits_.max_nesting_depth) {
           return parse_errc::nesting_too_deep;
         }
-        const std::uint64_t multiplier = type == '%' ? 2 : 1;
-        if (const parse_errc err =
-                read_children(static_cast<std::uint64_t>(*n) * multiplier, depth + 1, out.elements);
+        if (const parse_errc err = read_children(total, depth + 1, out.elements);
             err != parse_errc::none) {
           return err;
         }

@@ -136,3 +136,17 @@ TEST_CASE("deep parse rejects bad frames", "[resp][value]") {
   lim.max_nesting_depth = 2;
   REQUIRE(parse_tree("*1\r\n*1\r\n*1\r\n:1\r\n", lim).error() == parse_errc::nesting_too_deep);
 }
+
+TEST_CASE("empty aggregates are exempt from the depth limit (fuzzer regression)", "[resp][value]") {
+  // The depth limit guards recursion; empty aggregates never descend, and the
+  // shallow parser accepts them at any depth. Both parsers must agree.
+  limits lim;
+  lim.max_nesting_depth = 2;
+  REQUIRE(parse_tree("*1\r\n*1\r\n*0\r\n", lim));
+  REQUIRE(parse_tree("*1\r\n*1\r\n%0\r\n", lim));
+  REQUIRE(parse_tree("*1\r\n*1\r\n|0\r\n:1\r\n", lim));
+  // ...but a non-empty aggregate at the same position still trips it.
+  REQUIRE(parse_tree("*1\r\n*1\r\n*1\r\n:1\r\n", lim).error() == parse_errc::nesting_too_deep);
+  REQUIRE(parse_tree("*1\r\n*1\r\n|1\r\n+k\r\n+v\r\n:1\r\n", lim).error() ==
+          parse_errc::nesting_too_deep);
+}

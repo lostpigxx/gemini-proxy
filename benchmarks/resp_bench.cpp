@@ -31,8 +31,7 @@ std::string make_mget(std::size_t keys) {
   return out;
 }
 
-void bench_shallow(ankerl::nanobench::Bench& bench, std::string_view name,
-                   std::string_view frame) {
+void bench_shallow(ankerl::nanobench::Bench& bench, std::string_view name, std::string_view frame) {
   vkp::resp::parser parser;
   const std::string label = std::string(name) + " (" + std::to_string(frame.size()) + " B)";
   bench.batch(frame.size()).unit("byte").run(label, [&] {
