@@ -32,6 +32,16 @@ ctest --preset debug
 
 clang-format **必须是 20.1.8**——跨大版本输出会变，脚本会校验主版本号并在不符时报错。本机已装在 `~/Library/Python/3.9/bin/clang-format`（不在默认 PATH，脚本会自己找到）。重装：`python3 -m pip install --user "clang-format==20.1.8"`。
 
+## Fuzz
+
+```sh
+VKP_APT_MIRROR=http://mirrors.aliyun.com/ubuntu-ports/ ./scripts/fuzz.sh [秒数]   # 默认 60
+```
+
+Apple Clang 没有 libFuzzer 运行时，macOS 上脚本自动经 Docker 跑 Linux 原生 fuzz（构建缓存在
+`vkp-fuzz-cache` 卷里，首跑慢后续快）。触碰解析器后至少短跑一次。新语料会写回
+`fuzz/corpus/`，定期用 `-merge=1` 精简后提交。
+
 ## 本机环境
 
 - macOS（arm64），CMake 4.4，Ninja 已装，Apple Clang 21。
@@ -42,6 +52,14 @@ clang-format **必须是 20.1.8**——跨大版本输出会变，脚本会校�
   ```
   该 API 偶发 504，轮询时要容错。取具体 job 结果用 `/actions/runs/<id>/jobs`；**job 日志需要认证，匿名取会 403**，失败时优先在本地复现而不是死磕日志。
 - macOS 上只能构建和跑单测，io_uring 相关代码的真实验证需要 Linux。
+- **本机网络直连 docker.io 与 Ubuntu 官方 apt 源都极慢/不通**：拉镜像用
+  `docker.m.daocloud.io/library/...`（再 `docker tag` 回原名），容器内 apt 用
+  `http://mirrors.aliyun.com/ubuntu-ports/`（arm64；须 http，基础镜像没装 ca-certificates）。
+  GitHub 直连可用。
+- Docker 里可跑 Linux 构建/GCC 交叉验证/fuzz；`vkp-fuzz-cache` 卷内有 CPM 缓存与增量构建目录
+  （`/cache/build`、`/cache/build-gcc`）。
+- Ubuntu 24.04 的 clang-18 定义 `__cpp_concepts=201907L`，libstdc++ 的 `<expected>` 等
+  concepts-gated 头会被 guard 掉——别用 `std::expected`（Clang 19+ 才行，超出项目基线）。
 
 ## 工作约定
 
@@ -50,3 +68,7 @@ clang-format **必须是 20.1.8**——跨大版本输出会变，脚本会校�
 - 设计有分叉时，先在 `docs/design/` 写一页决策记录再动手。
 - 每个里程碑完成时更新开发计划文档：标记状态、记录与计划的偏差、回填实测数据（性能基线等）。
 - 验证命令的退出码时注意别被管道骗了（`cmd | head; echo $?` 拿到的是 `head` 的退出码）——M0 阶段的格式检查就因此假绿过一次。
+- zsh 下多个 glob 只要有一个无匹配，**整条命令直接失败**（`ls crash-* leak-*` 在只有
+  crash 文件时什么都不列）——M1 阶段曾因此漏看一个 fuzz crash 现场。查 fuzz 产物用
+  `ls crash-* 2>/dev/null; ls oom-* 2>/dev/null` 分开写。
+- 长时间后台任务别用 `docker run --rm`：容器异常退出时现场（日志、退出码）全没了。

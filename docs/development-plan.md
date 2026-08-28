@@ -16,7 +16,7 @@
 | 里程碑 | 主题 | 核心产物 | 状态 |
 |---|---|---|---|
 | M0 | 工程骨架 | 可构建、可测试、CI 全绿的空项目 | ✅ 完成（2026-08-24, `9b19060`） |
-| M1 | RESP 协议解析器 | 经 fuzz 验证的零拷贝 RESP2/3 解析与序列化库 |
+| M1 | RESP 协议解析器 | 经 fuzz 验证的零拷贝 RESP2/3 解析与序列化库 | ✅ 完成（2026-08-24） |
 | M2 | 事件循环 + 最小可用 proxy | `valkey-cli` 可通过 proxy 访问单个后端 |
 | M3 | 多线程 + 连接池 + pipelining | 可承受多连接压测的生产形态骨架 |
 | M4 | cluster 路由 | 对接 valkey cluster，处理 MOVED/ASK |
@@ -67,7 +67,9 @@
 
 ---
 
-## M1 — RESP 协议解析器
+## M1 — RESP 协议解析器 ✅
+
+**状态**：已完成（2026-08-24）。
 
 **目标**：全系统的性能核心与第一个真正模块。纯函数式（bytes in → 消息 out），不含任何 IO，可 100% 测试。
 
@@ -88,6 +90,47 @@
    - nanobench 基准：典型 GET/SET/MGET 报文的解析吞吐，建立第一条性能基线并记录在 docs。
 
 **验收标准**：单测全绿且覆盖全部 RESP3 类型；fuzz 本地跑 1 小时无 crash/泄漏；基准数字记录在案。
+
+**实施记录（与计划的偏差）**：
+
+- 设计文档：[docs/design/resp-buffer-and-parser.md](design/resp-buffer-and-parser.md)。核心不变量：
+  可读窗口始终从当前消息第 0 字节开始（只在消息边界 consume），解析器内部只存相对偏移，
+  缓冲扩容/压缩搬移不影响解析中间状态。
+- 浅解析器（`resp::parser`）按计划只定边界不物化树；命令形态（顶层 bulk 数组）时顺带暴露
+  全部参数视图（`args[0]`=命令名）。深解析器（`resp::parse_tree`）为控制面服务，非增量
+  （控制面消息先攒完整再解析）。
+- **深解析器 API 用自研 30 行 `tree_result` 而非 `std::expected`**：Ubuntu 24.04 的
+  clang-18 定义 `__cpp_concepts=201907L`，libstdc++ 将 `<expected>` guard 掉——
+  `std::expected` 实际要求 Clang 19+，与项目 Clang 18 基线冲突。
+- RESP3 streamed/chunked 类型显式报 `streamed_not_supported`（valkey 实际不发）；
+  inline command 按计划留 TODO（报 `unknown_type_byte`）。
+- attribute（`|`）与被注解值算**同一条**消息边界（FIFO 响应配对正确性所必需），
+  浅/深解析器同语义。
+- fuzz：Apple Clang 无 libFuzzer 运行时，`scripts/fuzz.sh` 在 macOS 上经 Docker 跑
+  Linux 原生 fuzz。harness 交叉验证「一次性浅解析 / 任意分块增量浅解析 / 完整帧深解析」
+  三方一致性，分歧即 abort。**上线 90 秒即抓到真 bug**：浅解析器按解析值接受 `*-01`
+  为 null 数组、深解析器按文本比较拒绝——两解析器对同一帧分歧（已修 + 回归测试 +
+  回归语料）。CI 增加 60 秒 fuzz job（clang-20 + ASan/UBSan）。
+- 测试：26 用例 / 2457 断言，全部 RESP2/3 类型 × 每字节截断 × 单 parser 增量重入；
+  另有 read_buffer+parser 任意分块端到端。GCC-14（容器）与 ASan/UBSan 均绿。
+- **fuzz 长跑（验收项）**：Linux 容器（clang-18 + ASan/UBSan），修复两个分歧后连续
+  3601 秒 / **126,985,113 次执行（~35k exec/s）无 crash 无泄漏**；语料经 `-merge=1`
+  精简为 477 个文件入库（含 3 个具名回归输入）。
+- **性能基线（验收项）**：macOS arm64（Apple Clang 21，release + mimalloc），
+  `vkp_resp_bench`，err% ≤ 2.7%：
+
+  | 报文 | 帧大小 | 吞吐 | 单帧耗时 |
+  |---|---|---|---|
+  | GET | 39 B | 1.44 GB/s | ~27 ns |
+  | SET（64 B value） | 110 B | 3.10 GB/s | ~36 ns |
+  | SET（1 KiB value） | 1072 B | 28.6 GB/s | ~37 ns |
+  | MGET 10 keys | 275 B | 2.30 GB/s | ~121 ns |
+  | MGET 100 keys | 2616 B | 2.06 GB/s | ~1.28 µs |
+  | 1 KiB bulk 响应 | 1033 B | 90.3 GB/s | ~11 ns |
+  | 深解析 MGET 100（对照） | 2616 B | 2.25 GB/s | — |
+
+  解读：大 payload 场景吞吐由「跳过 payload」主导（接近 memcpy 量级）；小帧场景
+  ~27ns/帧 ≈ 每秒 3600 万条 GET，解析不会成为 M2/M3 的瓶颈。M6 优化的对照起点。
 
 ---
 

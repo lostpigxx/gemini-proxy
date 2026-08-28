@@ -56,7 +56,7 @@ int main() {
   }();
 
   ankerl::nanobench::Bench bench;
-  bench.title("RESP shallow parse (bytes/s is the headline number)").minEpochIterations(50000);
+  bench.title("RESP shallow parse (bytes/s is the headline number)").minEpochIterations(600000);
 
   bench_shallow(bench, "GET", get);
   bench_shallow(bench, "SET 64B value", set_64);
