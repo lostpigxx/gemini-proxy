@@ -80,6 +80,8 @@ void frame_pool::deallocate(void* p) noexcept {
   ++g_pool.counts[bucket];
 }
 
-frame_pool::stats frame_pool::thread_stats() noexcept { return g_pool.stats; }
+frame_pool::stats frame_pool::thread_stats() noexcept {
+  return g_pool.stats;
+}
 
 }  // namespace vkp::io::detail

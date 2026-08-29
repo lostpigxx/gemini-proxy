@@ -35,8 +35,7 @@ class task_promise_base {
   struct final_awaiter {
     [[nodiscard]] bool await_ready() const noexcept { return false; }
     template <typename Promise>
-    [[nodiscard]] std::coroutine_handle<> await_suspend(
-        std::coroutine_handle<Promise> h) noexcept {
+    [[nodiscard]] std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
       auto& base = static_cast<task_promise_base&>(h.promise());
       return base.continuation_ ? base.continuation_ : std::noop_coroutine();
     }
@@ -176,8 +175,7 @@ struct root_task {
 };
 
 template <typename T>
-root_task sync_wait_run(task<T> t, std::optional<T>& out, std::exception_ptr& error,
-                        bool& done) {
+root_task sync_wait_run(task<T> t, std::optional<T>& out, std::exception_ptr& error, bool& done) {
   try {
     out.emplace(co_await std::move(t));
   } catch (...) {

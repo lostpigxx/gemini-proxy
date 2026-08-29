@@ -1,9 +1,10 @@
 #include "io/task.hpp"
 
-#include <catch2/catch_test_macros.hpp>
 #include <memory>
 #include <stdexcept>
 #include <string>
+
+#include <catch2/catch_test_macros.hpp>
 
 #include "io/frame_pool.hpp"
 
@@ -13,9 +14,13 @@ using vkp::io::spawn;
 using vkp::io::sync_wait;
 using vkp::io::task;
 
-task<int> forty_two() { co_return 42; }
+task<int> forty_two() {
+  co_return 42;
+}
 
-task<std::string> concat(std::string a, std::string b) { co_return a + b; }
+task<std::string> concat(std::string a, std::string b) {
+  co_return a + b;
+}
 
 task<int> add_nested(int a, int b) {
   int x = co_await forty_two();
@@ -67,7 +72,7 @@ TEST_CASE("task is lazy until awaited", "[io][task]") {
     auto t = set_flag(flag);
     CHECK(t.valid());
     CHECK_FALSE(flag);  // body has not started
-  }                     // destroying the unawaited task must not leak (ASan-checked)
+  }  // destroying the unawaited task must not leak (ASan-checked)
   CHECK_FALSE(flag);
 }
 
@@ -85,9 +90,16 @@ TEST_CASE("move semantics transfer ownership", "[io][task]") {
 }
 
 TEST_CASE("deep recursive chain does not overflow the stack", "[io][task]") {
-  // 100k frames alive at once; unwinding relies on symmetric transfer being
-  // a genuine tail call at every optimization level.
-  CHECK(sync_wait(chain(100'000)) == 100'000);
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__OPTIMIZE__)
+  // GCC only emits the symmetric-transfer tail call with
+  // -foptimize-sibling-calls (-O2+, PR 100897); an unoptimized deep chain
+  // genuinely overflows. Clang guarantees the tail call at every level
+  // (one reason production builds are Clang).
+  constexpr int kDepth = 1'000;
+#else
+  constexpr int kDepth = 100'000;
+#endif
+  CHECK(sync_wait(chain(kDepth)) == kDepth);
 }
 
 TEST_CASE("spawn runs a detached task to completion", "[io][task]") {
@@ -114,8 +126,7 @@ TEST_CASE("frame pool recycles coroutine frames", "[io][task][frame_pool]") {
   CHECK(after.fresh == before.fresh);
 }
 
-TEST_CASE("frame pool falls back to operator new for oversized frames",
-          "[io][task][frame_pool]") {
+TEST_CASE("frame pool falls back to operator new for oversized frames", "[io][task][frame_pool]") {
   using vkp::io::detail::frame_pool;
 
   // A frame holding a 4 KiB array exceeds kMaxPooledSize and must take the
