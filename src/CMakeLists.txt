@@ -1,6 +1,7 @@
 # Core library: everything except main(), shared by proxyd/tests/benchmarks/fuzzers.
 add_library(vkp_lib STATIC
   core/buffer.cpp
+  io/frame_pool.cpp
   resp/parser.cpp
   resp/serializer.cpp
   resp/value.cpp
