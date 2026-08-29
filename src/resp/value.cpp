@@ -1,8 +1,11 @@
 #include "resp/value.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -22,13 +25,24 @@ std::optional<std::int64_t> parse_i64(std::string_view s) {
   return v;
 }
 
-// RESP3 doubles: from_chars general format covers digits, exponents and the
-// "inf"/"-inf"/"nan" spellings valkey emits.
+// RESP3 doubles: digits/exponents plus the "inf"/"-inf"/"nan" spellings
+// valkey emits. strtod instead of from_chars: libc++ only grew floating-point
+// from_chars in LLVM 20, and CI's Apple Clang is older. Cold path, so the
+// bounce through a NUL-terminated buffer costs nothing that matters.
 std::optional<double> parse_f64(std::string_view s) {
-  double v = 0.0;
-  const char* end = s.data() + s.size();
-  const auto [ptr, ec] = std::from_chars(s.data(), end, v);
-  if (ec != std::errc{} || ptr != end) {
+  char buf[64];  // real RESP3 double lines are far shorter
+  if (s.empty() || s.size() >= sizeof(buf)) {
+    return std::nullopt;
+  }
+  // strtod skips leading whitespace; RESP forbids it, so reject up front.
+  if (std::isspace(static_cast<unsigned char>(s.front())) != 0) {
+    return std::nullopt;
+  }
+  std::memcpy(buf, s.data(), s.size());
+  buf[s.size()] = '\0';
+  char* end = nullptr;
+  const double v = std::strtod(buf, &end);
+  if (end != buf + s.size()) {
     return std::nullopt;
   }
   return v;
