@@ -17,7 +17,7 @@
 |---|---|---|---|
 | M0 | 工程骨架 | 可构建、可测试、CI 全绿的空项目 | ✅ 完成（2026-08-24, `9b19060`） |
 | M1 | RESP 协议解析器 | 经 fuzz 验证的零拷贝 RESP2/3 解析与序列化库 | ✅ 完成（2026-08-24） |
-| M2 | 事件循环 + 最小可用 proxy | `valkey-cli` 可通过 proxy 访问单个后端 |
+| M2 | 事件循环 + 最小可用 proxy | `valkey-cli` 可通过 proxy 访问单个后端 | ✅ 完成（2026-08-31） |
 | M3 | 多线程 + 连接池 + pipelining | 可承受多连接压测的生产形态骨架 |
 | M4 | cluster 路由 | 对接 valkey cluster，处理 MOVED/ASK |
 | M5 | 可观测性与配置 | metrics / 日志 / 配置 / 优雅关闭 |
@@ -134,7 +134,9 @@
 
 ---
 
-## M2 — 事件循环 + 最小可用 proxy
+## M2 — 事件循环 + 最小可用 proxy ✅
+
+**状态**：已完成（2026-08-31）。设计文档：[docs/design/io-and-coroutines.md](design/io-and-coroutines.md)。
 
 **目标**：立起 IO 抽象与协程框架，做出第一个可演示的 proxy（单后端、单线程、整条透传）。
 
@@ -154,6 +156,37 @@
 7. **优雅关闭**：SIGTERM 后停止 accept、等待在途请求、超时强关。
 
 **验收标准**：`valkey-cli -p <proxy> PING/SET/GET/MGET` 全部正确；`valkey-benchmark -c 1` 可完整跑完；ASan/TSan 下压测无报告；macOS 上 kqueue 路径同样通过功能测试。
+
+**实施记录（与计划的偏差）**：
+
+- 分层落地为 `task<T>`（`io/task.hpp`）→ `operation` 完成对象（嵌于协程帧，地址稳定，
+  backend 裸存指针、io_uring 直接塞 `user_data`，零额外分配）→ `event_loop`（ready
+  队列 + 定时器最小堆，backend 无关）→ `backend` 三实现。完成结果统一 io_uring CQE
+  约定（`>=0` 载荷 / `<0` 为 `-errno`），reactor 端向它看齐。
+- **multishot 全部推迟到 M6**（计划偏差）：multishot recv 依赖 provided buffer ring
+  （`IORING_RECV_MULTISHOT` 必须 `IOSQE_BUFFER_SELECT`），计划里「multishot recv 在
+  M2、buffer ring 在 M6」不可拆；multishot accept 一并到 M6 评估。M2 io_uring 为
+  单发 op + poll 内 `submit_and_wait` 批量提交。
+- **per-op 超时（LINK_TIMEOUT）挪到 M3**：与 M3「超时体系」合并实施；M2 完成
+  `sleep_for`（用户态定时器堆）与 `cancel_slot`（asio per-op 取消骨架）。
+- 运行时探测按计划：`make_backend()` 构造 io_uring 失败自动降级 epoll，Docker 默认
+  seccomp 下实测降级生效；`--io-backend` 可强制。
+- 优雅关闭：SIGTERM/SIGINT → socketpair self-pipe（**不用 pipe：io_uring 的 RECV
+  仅支持 socket**）→ 取消 accept → drain → 5s grace 强关；再来一次信号立即停。
+  实测：drain 期间新连接被拒、5.1s 退出、exit code 0。
+- **教训：accept 出的客户端 socket 必须设 TCP_NODELAY**——只给后端侧连接设了会在
+  pipeline 客户端下触发 Nagle+delayed-ACK 停顿，容器实测 `-P 8` 只有 ~190 rps，
+  修后 ~24k rps（126×）。
+- 已知编译器差异：GCC 仅在 `-foptimize-sibling-calls`（-O2+）下才把 symmetric
+  transfer 编译成真尾调用（PR 100897），-O0 深链会真实爆栈；深链测试按编译器降深度。
+  Clang 全优化级别保证尾调用（生产编译器选 Clang 的又一依据）。
+- epoll 后端用 `epoll_pwait2`（内核 5.11+/glibc 2.35+，在 Ubuntu 24.04 基线内）。
+- 验收实测：macOS(kqueue，本机 redis-server) 与 Linux 容器(epoll + io_uring，
+  clang ASan/UBSan 构建) `redis-cli` PING/SET/GET/MGET/INCR/TYPE/RESP3 HELLO 全部
+  正确；`redis-benchmark -c 1 -n 5000`（约 15~18k rps @ ASan 构建）与 `-c 1 -P 8`
+  完整跑完，无 sanitizer 报告；TSan 全测试 + 实流量无报告；GCC-14 Debug/Release
+  容器全绿。测试规模：40 用例 / 2506 断言（IO 层按 `available_backends()` 参数化，
+  Linux 上同套测试跑 epoll 与 io_uring 两遍）。
 
 ---
 
@@ -219,7 +252,8 @@
 1. **基准环境固化**：`scripts/bench.sh` 一键跑 valkey-benchmark/memtier 标准场景集（不同 value 大小 × pipeline 深度 × 连接数），输出对比直连的报告；每次优化前后跑同一套。
 2. **profile**：perf + 火焰图定位热点；重点检查：syscall 次数/请求、内存分配次数/请求、跨核 cache miss。
 3. **候选优化项**（按预期收益排序，逐项用数据验证取舍）：
-   - provided buffer ring（io_uring 内核选 buffer，省 per-recv 提交）
+   - provided buffer ring + multishot recv/accept（M2 移交：multishot recv 依赖
+     buffer ring，两者必须一起做）
    - 批量 submit（一次 `io_uring_submit` 提交多个 SQE）与回写合并（多条响应一次 send）
    - 协程帧内存池调优（复用率统计、尺寸分级）
    - RESP 解析器热点优化（memchr 向量化查找 CRLF 等）
