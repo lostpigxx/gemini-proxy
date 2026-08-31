@@ -21,8 +21,8 @@ constexpr std::string_view kBackendLost = "-ERR proxy: backend connection lost\r
 struct frame_result {
   enum class kind : std::uint8_t { frame, eof, io_error, protocol_error };
   kind k = kind::frame;
-  std::size_t len = 0;                            // frame bytes at the buffer front
-  std::int32_t err = 0;                           // -errno for io_error
+  std::size_t len = 0;                             // frame bytes at the buffer front
+  std::int32_t err = 0;                            // -errno for io_error
   resp::parse_errc perr = resp::parse_errc::none;  // for protocol_error
 };
 
@@ -38,8 +38,7 @@ io::task<frame_result> read_frame(io::event_loop& loop, int fd, read_buffer& buf
           co_return frame_result{.k = frame_result::kind::frame,
                                  .len = parser.message().raw.size()};
         case resp::parse_status::protocol_error:
-          co_return frame_result{.k = frame_result::kind::protocol_error,
-                                 .perr = parser.error()};
+          co_return frame_result{.k = frame_result::kind::protocol_error, .perr = parser.error()};
         case resp::parse_status::need_more:
           break;
       }
@@ -65,7 +64,9 @@ server::server(io::event_loop& loop, config cfg)
       listener_(io::listen_tcp(cfg_.listen_host, cfg_.listen_port, cfg_.backlog)),
       port_(io::local_port(listener_.get())) {}
 
-void server::start() { io::spawn(acceptor()); }
+void server::start() {
+  io::spawn(acceptor());
+}
 
 void server::begin_shutdown() {
   if (draining_) {
@@ -136,8 +137,7 @@ io::task<void> server::relay(int client_fd, int backend_fd) {
     // 1. One complete request frame from the client.
     const frame_result req = co_await read_frame(loop_, client_fd, cbuf, req_parser);
     if (req.k == frame_result::kind::protocol_error) {
-      const std::string err =
-          fmt::format("-ERR Protocol error: {}\r\n", resp::to_string(req.perr));
+      const std::string err = fmt::format("-ERR Protocol error: {}\r\n", resp::to_string(req.perr));
       (void)co_await io::send_all(loop_, client_fd, err);
       break;
     }

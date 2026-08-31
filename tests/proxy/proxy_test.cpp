@@ -1,14 +1,14 @@
-#include "proxy/server.hpp"
-
-#include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <string>
+
+#include <catch2/catch_test_macros.hpp>
 
 #include "core/buffer.hpp"
 #include "io/backend.hpp"
 #include "io/event_loop.hpp"
 #include "io/socket.hpp"
 #include "io/task.hpp"
+#include "proxy/server.hpp"
 #include "resp/parser.hpp"
 
 using namespace std::chrono_literals;
@@ -60,8 +60,7 @@ io::task<void> fake_backend_acceptor(io::event_loop& loop, int listen_fd) {
 // Sends `payload`, collects replies until `expect_len` bytes or peer close,
 // then initiates proxy shutdown so loop.run() terminates.
 io::task<void> client_script(io::event_loop& loop, std::uint16_t port, std::string payload,
-                             std::size_t expect_len, std::string& out,
-                             vkp::proxy::server& srv) {
+                             std::size_t expect_len, std::string& out, vkp::proxy::server& srv) {
   try {
     io::unique_fd fd = co_await io::connect_tcp(loop, io::resolve_tcp("127.0.0.1", port));
     (void)co_await io::send_all(loop, fd.get(), payload);
@@ -103,8 +102,8 @@ TEST_CASE("proxy relays frames per backend", "[proxy]") {
 
         SECTION("two pipelined PINGs come back as two PONGs, in order") {
           std::string out;
-          io::spawn(client_script(loop, srv.port(),
-                                  std::string{kPing} + std::string{kPing}, 14, out, srv));
+          io::spawn(client_script(loop, srv.port(), std::string{kPing} + std::string{kPing}, 14,
+                                  out, srv));
           loop.run();
           CHECK(out == "+PONG\r\n+PONG\r\n");
           CHECK(srv.active_connections() == 0);
