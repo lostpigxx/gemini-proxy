@@ -1,14 +1,14 @@
 #include "io/event_loop.hpp"
 
-#include <catch2/catch_test_macros.hpp>
 #include <cerrno>
 #include <chrono>
+#include <fcntl.h>
 #include <string>
 #include <sys/socket.h>
 #include <system_error>
-
-#include <fcntl.h>
 #include <unistd.h>
+
+#include <catch2/catch_test_macros.hpp>
 
 #include "io/backend.hpp"
 #include "io/socket.hpp"

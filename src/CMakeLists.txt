@@ -5,6 +5,7 @@ add_library(vkp_lib STATIC
   io/event_loop.cpp
   io/frame_pool.cpp
   io/socket.cpp
+  proxy/server.cpp
   resp/parser.cpp
   resp/serializer.cpp
   resp/value.cpp

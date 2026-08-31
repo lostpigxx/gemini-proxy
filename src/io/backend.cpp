@@ -61,9 +61,9 @@ std::unique_ptr<backend> make_backend(backend_kind kind) {
       break;
 #endif
   }
-  throw std::system_error(ENOTSUP, std::generic_category(),
-                          std::string("backend unavailable on this platform: ") +
-                              std::string(to_string(kind)));
+  throw std::system_error(
+      ENOTSUP, std::generic_category(),
+      std::string("backend unavailable on this platform: ") + std::string(to_string(kind)));
 }
 
 std::vector<backend_kind> available_backends() {

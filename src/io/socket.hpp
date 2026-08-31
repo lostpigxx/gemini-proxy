@@ -48,10 +48,13 @@ struct resolved_addr {
 
 // Nonblocking + cloexec listener with SO_REUSEADDR; port 0 picks an
 // ephemeral port (see local_port). Throws std::system_error.
-[[nodiscard]] unique_fd listen_tcp(const std::string& host, std::uint16_t port,
-                                   int backlog = 1024);
+[[nodiscard]] unique_fd listen_tcp(const std::string& host, std::uint16_t port, int backlog = 1024);
 
 [[nodiscard]] std::uint16_t local_port(int fd);  // throws std::system_error
+
+// TCP_NODELAY for accepted sockets. Without it, serial small replies into a
+// pipelining client stall on Nagle + delayed ACK (~40 ms per batch).
+void set_tcp_nodelay(int fd) noexcept;
 
 // Nonblocking connected TCP socket with TCP_NODELAY set.
 // Throws std::system_error on failure (including -ECANCELED during stop()).

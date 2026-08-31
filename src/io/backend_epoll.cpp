@@ -2,14 +2,13 @@
 // First-class citizen: the mandatory fallback wherever io_uring is disabled
 // (seccomp, kernel.io_uring_disabled, old kernels). Architecture decision 1.2.
 
-#include <sys/epoll.h>
-#include <sys/socket.h>
-
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cerrno>
 #include <ctime>
+#include <sys/epoll.h>
+#include <sys/socket.h>
 #include <system_error>
 #include <unistd.h>
 #include <unordered_map>
@@ -220,8 +219,8 @@ class epoll_backend final : public backend {
   // Syncs the epoll interest mask with the live slots; drops the fd_state
   // entry (invalidating `st`!) once both slots are empty.
   void update_registration(fd_state& st, ready_queue& ready) {
-    const std::uint32_t want = (st.reader != nullptr ? EPOLLIN : 0U) |
-                               (st.writer != nullptr ? EPOLLOUT : 0U);
+    const std::uint32_t want =
+        (st.reader != nullptr ? EPOLLIN : 0U) | (st.writer != nullptr ? EPOLLOUT : 0U);
     if (want == st.armed) {
       return;
     }
@@ -233,8 +232,7 @@ class epoll_backend final : public backend {
     epoll_event ev{};
     ev.events = want;  // level-triggered
     ev.data.ptr = &st;
-    const int rc =
-        ::epoll_ctl(ep_, st.armed == 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, st.fd, &ev);
+    const int rc = ::epoll_ctl(ep_, st.armed == 0 ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, st.fd, &ev);
     if (rc != 0) {
       const int err = errno;
       for (operation** slot : {&st.reader, &st.writer}) {
@@ -261,6 +259,8 @@ class epoll_backend final : public backend {
 
 }  // namespace
 
-std::unique_ptr<backend> make_epoll_backend() { return std::make_unique<epoll_backend>(); }
+std::unique_ptr<backend> make_epoll_backend() {
+  return std::make_unique<epoll_backend>();
+}
 
 }  // namespace vkp::io

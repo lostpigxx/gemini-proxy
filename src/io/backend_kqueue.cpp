@@ -1,14 +1,13 @@
 // kqueue reactor backend: readiness → nonblocking syscall → completion.
 // macOS development only; no performance ambitions (architecture decision 1.4).
 
-#include <sys/event.h>
-#include <sys/socket.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <ctime>
 #include <fcntl.h>
+#include <sys/event.h>
+#include <sys/socket.h>
 #include <system_error>
 #include <unistd.h>
 #include <unordered_set>
@@ -208,6 +207,8 @@ class kqueue_backend final : public backend {
 
 }  // namespace
 
-std::unique_ptr<backend> make_kqueue_backend() { return std::make_unique<kqueue_backend>(); }
+std::unique_ptr<backend> make_kqueue_backend() {
+  return std::make_unique<kqueue_backend>();
+}
 
 }  // namespace vkp::io

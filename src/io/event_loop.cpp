@@ -37,8 +37,7 @@ event_loop::io_awaiter event_loop::async_send(int fd, std::span<const char> buf,
   return io_awaiter{*this, op, slot};
 }
 
-event_loop::io_awaiter event_loop::async_connect(int fd, const sockaddr* addr,
-                                                 socklen_t addr_len,
+event_loop::io_awaiter event_loop::async_connect(int fd, const sockaddr* addr, socklen_t addr_len,
                                                  cancel_slot* slot) noexcept {
   operation op;
   op.op = opcode::connect;

@@ -3,14 +3,14 @@
 // buffer rings (IORING_RECV_MULTISHOT implies IOSQE_BUFFER_SELECT), so both
 // move to M6 together. See docs/design/io-and-coroutines.md §3.
 
-#include <liburing.h>
-#include <sys/socket.h>
-
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <sys/socket.h>
 #include <system_error>
 #include <unordered_set>
+
+#include <liburing.h>
 
 #include "io/backend.hpp"
 
@@ -54,8 +54,7 @@ class uring_backend final : public backend {
         io_uring_prep_send(sqe, op.fd, op.wbuf, op.len, MSG_NOSIGNAL);
         break;
       case opcode::connect:
-        io_uring_prep_connect(sqe, op.fd, reinterpret_cast<const sockaddr*>(&op.addr),
-                              op.addr_len);
+        io_uring_prep_connect(sqe, op.fd, reinterpret_cast<const sockaddr*>(&op.addr), op.addr_len);
         break;
       case opcode::nop:
       case opcode::timeout:
@@ -146,6 +145,8 @@ class uring_backend final : public backend {
 
 }  // namespace
 
-std::unique_ptr<backend> make_uring_backend() { return std::make_unique<uring_backend>(); }
+std::unique_ptr<backend> make_uring_backend() {
+  return std::make_unique<uring_backend>();
+}
 
 }  // namespace vkp::io

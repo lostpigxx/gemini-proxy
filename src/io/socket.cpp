@@ -33,6 +33,11 @@ void set_common_options(int fd) {
 
 }  // namespace
 
+void set_tcp_nodelay(int fd) noexcept {
+  const int one = 1;
+  (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
 void unique_fd::reset() noexcept {
   if (fd_ >= 0) {
     ::close(fd_);
@@ -49,8 +54,7 @@ resolved_addr resolve_tcp(const std::string& host, std::uint16_t port) {
   addrinfo* list = nullptr;
   const std::string service = std::to_string(port);
   if (const int rc = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &list); rc != 0) {
-    throw std::runtime_error(
-        fmt::format("resolve {}:{}: {}", host, port, ::gai_strerror(rc)));
+    throw std::runtime_error(fmt::format("resolve {}:{}: {}", host, port, ::gai_strerror(rc)));
   }
 
   resolved_addr out;
@@ -73,8 +77,7 @@ unique_fd listen_tcp(const std::string& host, std::uint16_t port, int backlog) {
   (void)::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
   if (::bind(fd.get(), reinterpret_cast<const sockaddr*>(&target.addr), target.len) != 0) {
-    throw std::system_error(errno, std::generic_category(),
-                            fmt::format("bind {}:{}", host, port));
+    throw std::system_error(errno, std::generic_category(), fmt::format("bind {}:{}", host, port));
   }
   if (::listen(fd.get(), backlog) != 0) {
     throw std::system_error(errno, std::generic_category(), "listen");

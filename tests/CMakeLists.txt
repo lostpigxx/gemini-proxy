@@ -5,6 +5,7 @@ add_executable(vkp_tests
   core/buffer_test.cpp
   io/event_loop_test.cpp
   io/task_test.cpp
+  proxy/proxy_test.cpp
   resp/parser_test.cpp
   resp/serializer_test.cpp
   resp/value_test.cpp
