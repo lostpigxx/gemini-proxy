@@ -46,4 +46,7 @@ if [[ "${1:-}" == "--check" ]]; then
   mode_args=(--dry-run --Werror)
 fi
 
-git ls-files '*.cpp' '*.hpp' | xargs "${cf}" "${mode_args[@]}"
+# --others --exclude-standard: also cover new files not yet git-added (a
+# plain ls-files once skipped untracked sources and let CI catch them).
+git ls-files --cached --others --exclude-standard '*.cpp' '*.hpp' \
+  | xargs "${cf}" "${mode_args[@]}"
