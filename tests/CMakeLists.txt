@@ -3,8 +3,10 @@ include(Catch)
 add_executable(vkp_tests
   core/smoke_test.cpp
   core/buffer_test.cpp
+  core/byte_queue_test.cpp
   io/event_loop_test.cpp
   io/task_test.cpp
+  io/wait_queue_test.cpp
   proxy/proxy_test.cpp
   resp/parser_test.cpp
   resp/serializer_test.cpp

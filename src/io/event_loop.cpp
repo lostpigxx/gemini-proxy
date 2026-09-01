@@ -138,6 +138,12 @@ void event_loop::run() {
       continue;  // due timers fired (or a resume queued work): drain first
     }
     if (backend_->pending() == 0 && timers_.empty()) {
+      // Only parked wait_queue waiters could remain — and with no completion
+      // ever coming, nobody can notify them. Fail them instead of leaking
+      // their frames or blocking forever in poll().
+      if (parked_waiters_ > 0 && cancel_parked_waiters() > 0) {
+        continue;
+      }
       break;  // nothing can ever complete again
     }
     backend_->poll(next_deadline, ready_);
@@ -155,6 +161,7 @@ void event_loop::stop() noexcept {
     ready_.push(*t.op);
   }
   timers_.clear();
+  (void)cancel_parked_waiters();
 }
 
 }  // namespace vkp::io

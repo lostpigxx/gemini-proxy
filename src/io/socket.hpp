@@ -47,8 +47,11 @@ struct resolved_addr {
 [[nodiscard]] resolved_addr resolve_tcp(const std::string& host, std::uint16_t port);
 
 // Nonblocking + cloexec listener with SO_REUSEADDR; port 0 picks an
-// ephemeral port (see local_port). Throws std::system_error.
-[[nodiscard]] unique_fd listen_tcp(const std::string& host, std::uint16_t port, int backlog = 1024);
+// ephemeral port (see local_port). `reuseport` additionally sets
+// SO_REUSEPORT before bind (per-worker listeners, kernel load balancing).
+// Throws std::system_error.
+[[nodiscard]] unique_fd listen_tcp(const std::string& host, std::uint16_t port, int backlog = 1024,
+                                   bool reuseport = false);
 
 [[nodiscard]] std::uint16_t local_port(int fd);  // throws std::system_error
 
@@ -61,7 +64,8 @@ void set_tcp_nodelay(int fd) noexcept;
 [[nodiscard]] task<unique_fd> connect_tcp(event_loop& loop, resolved_addr addr);
 
 // Loops async_send until all of `data` is written. Returns 0 on success or
-// -errno from the failing send.
-[[nodiscard]] task<std::int32_t> send_all(event_loop& loop, int fd, std::string_view data);
+// -errno from the failing send. `slot` cancels the send in flight.
+[[nodiscard]] task<std::int32_t> send_all(event_loop& loop, int fd, std::string_view data,
+                                          cancel_slot* slot = nullptr);
 
 }  // namespace vkp::io

@@ -2,6 +2,7 @@
 // Design: docs/design/io-and-coroutines.md §1, §4.
 #pragma once
 
+#include <cassert>
 #include <chrono>
 #include <coroutine>
 #include <cstdint>
@@ -17,17 +18,26 @@ namespace vkp::io {
 
 class event_loop;
 
-// Per-operation cancellation skeleton (asio semantics; M3 grows this into
-// race/timeout composition). Bind one slot to at most one in-flight op.
+// Per-operation cancellation (asio per-op semantics). Bind one slot to at
+// most one in-flight op. reset() re-arms a fired slot for reuse.
 class cancel_slot {
  public:
   [[nodiscard]] bool requested() const noexcept { return requested_; }
+
+  // Clears a previous cancel request. Only legal once the cancelled op has
+  // completed (no op may be pending on this slot).
+  void reset() noexcept {
+    assert(pending_ == nullptr);
+    requested_ = false;
+  }
 
  private:
   friend class event_loop;
   bool requested_ = false;
   operation* pending_ = nullptr;
 };
+
+class wait_queue;
 
 class event_loop {
  public:
@@ -77,8 +87,13 @@ class event_loop {
   [[nodiscard]] io_awaiter schedule() noexcept;
 
   // Requests cancellation of the op bound to `slot` (if any) and makes every
-  // future submit through `slot` complete instantly with -ECANCELED.
+  // future submit through `slot` complete instantly with -ECANCELED (until
+  // slot.reset()).
   void cancel(cancel_slot& slot) noexcept;
+
+  // Pushes an op whose result is already set onto the ready queue; its
+  // continuation resumes on the next drain. Used by wait_queue::notify.
+  void post(operation& op) noexcept { ready_.push(op); }
 
   // Runs until there is no pending work (ops, timers, ready) — or, after
   // stop(), until all cancelled coroutines have unwound. Coroutines still
@@ -95,6 +110,7 @@ class event_loop {
 
  private:
   friend class io_awaiter;
+  friend class wait_queue;
 
   struct timer_entry {
     std::chrono::steady_clock::time_point deadline;
@@ -111,9 +127,14 @@ class event_loop {
   // Moves due timers to ready; returns the next deadline if any remain.
   std::optional<std::chrono::nanoseconds> expire_timers();
 
+  // Cancels every waiter parked in registered wait_queues; returns how many.
+  std::size_t cancel_parked_waiters() noexcept;
+
   std::unique_ptr<backend> backend_;
   ready_queue ready_;
-  std::vector<timer_entry> timers_;  // heap via std::push_heap/pop_heap
+  std::vector<timer_entry> timers_;    // heap via std::push_heap/pop_heap
+  wait_queue* wait_queues_ = nullptr;  // intrusive registry (see wait_queue)
+  std::size_t parked_waiters_ = 0;
   bool stopping_ = false;
 };
 

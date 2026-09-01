@@ -64,7 +64,7 @@ resolved_addr resolve_tcp(const std::string& host, std::uint16_t port) {
   return out;
 }
 
-unique_fd listen_tcp(const std::string& host, std::uint16_t port, int backlog) {
+unique_fd listen_tcp(const std::string& host, std::uint16_t port, int backlog, bool reuseport) {
   const resolved_addr target = resolve_tcp(host, port);
 
   unique_fd fd{::socket(target.addr.ss_family, SOCK_STREAM, IPPROTO_TCP)};
@@ -75,6 +75,9 @@ unique_fd listen_tcp(const std::string& host, std::uint16_t port, int backlog) {
 
   const int one = 1;
   (void)::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  if (reuseport && ::setsockopt(fd.get(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) != 0) {
+    throw std::system_error(errno, std::generic_category(), "setsockopt(SO_REUSEPORT)");
+  }
 
   if (::bind(fd.get(), reinterpret_cast<const sockaddr*>(&target.addr), target.len) != 0) {
     throw std::system_error(errno, std::generic_category(), fmt::format("bind {}:{}", host, port));
@@ -113,10 +116,11 @@ task<unique_fd> connect_tcp(event_loop& loop, resolved_addr addr) {
   co_return fd;
 }
 
-task<std::int32_t> send_all(event_loop& loop, int fd, std::string_view data) {
+task<std::int32_t> send_all(event_loop& loop, int fd, std::string_view data, cancel_slot* slot) {
   std::size_t off = 0;
   while (off < data.size()) {
-    const std::int32_t n = co_await loop.async_send(fd, {data.data() + off, data.size() - off});
+    const std::int32_t n =
+        co_await loop.async_send(fd, {data.data() + off, data.size() - off}, slot);
     if (n < 0) {
       co_return n;
     }
