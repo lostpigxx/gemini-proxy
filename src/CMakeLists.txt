@@ -6,6 +6,7 @@ add_library(vkp_lib STATIC
   io/frame_pool.cpp
   io/socket.cpp
   io/wait_queue.cpp
+  proxy/command_table.cpp
   proxy/server.cpp
   resp/parser.cpp
   resp/serializer.cpp
