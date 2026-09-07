@@ -1,9 +1,7 @@
 #include <csignal>
 #include <cstdlib>
-#include <fcntl.h>
 #include <stdexcept>
 #include <string>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include <CLI/CLI.hpp>
@@ -15,39 +13,20 @@
 
 #include "core/version.hpp"
 #include "io/backend.hpp"
-#include "io/event_loop.hpp"
-#include "io/socket.hpp"
-#include "io/task.hpp"
 #include "proxy/server.hpp"
+#include "proxy/worker_pool.hpp"
 
 namespace {
 
-// Self-pipe via socketpair: write(2) is async-signal-safe, and recv works on
-// AF_UNIX sockets under every backend (io_uring's RECV is socket-only).
-int g_signal_fd = -1;
+// Async-signal-safe shutdown fan-out: one byte to every worker's self-pipe.
+constexpr int kMaxWorkers = 256;
+int g_signal_fds[kMaxWorkers];
+int g_signal_fd_count = 0;
 
 extern "C" void on_signal(int /*signo*/) {
   const char byte = 1;
-  (void)!::write(g_signal_fd, &byte, 1);
-}
-
-vkp::io::task<void> signal_watcher(vkp::io::event_loop& loop, vkp::proxy::server& srv, int fd,
-                                   quill::Logger* logger) {
-  char buf[16];
-  for (;;) {
-    const std::int32_t n = co_await loop.async_recv(fd, buf);
-    if (n <= 0) {
-      co_return;  // -ECANCELED once the loop stops
-    }
-    if (srv.active_connections() > 0) {
-      LOG_INFO(logger,
-               "shutdown requested: draining {} connection(s), grace 5s "
-               "(signal again to force)",
-               srv.active_connections());
-    } else {
-      LOG_INFO(logger, "shutdown requested");
-    }
-    srv.begin_shutdown();
+  for (int i = 0; i < g_signal_fd_count; ++i) {
+    (void)!::write(g_signal_fds[i], &byte, 1);
   }
 }
 
@@ -80,11 +59,25 @@ int main(int argc, char** argv) {
   std::string listen_ep = "127.0.0.1:6380";
   std::string backend_ep = "127.0.0.1:6379";
   std::string io_backend = "auto";
+  std::size_t workers = 1;
+  bool cpu_affinity = false;
+  std::size_t conns_per_backend = 1;
+  std::uint32_t request_timeout_ms = 1000;
   app.add_option("-l,--listen", listen_ep, "Listen endpoint (host:port)")->capture_default_str();
   app.add_option("-b,--backend", backend_ep, "Backend valkey endpoint (host:port)")
       ->capture_default_str();
   app.add_option("--io-backend", io_backend, "IO backend")
       ->check(CLI::IsMember({"auto", "io_uring", "epoll", "kqueue"}))
+      ->capture_default_str();
+  app.add_option("-w,--workers", workers, "Worker threads (0 = one per hardware thread)")
+      ->capture_default_str();
+  app.add_flag("--cpu-affinity", cpu_affinity, "Pin workers to CPUs (Linux only)");
+  app.add_option("--conns-per-backend", conns_per_backend,
+                 "Backend connections per worker (1-2 recommended)")
+      ->check(CLI::Range(1, 8))
+      ->capture_default_str();
+  app.add_option("--request-timeout-ms", request_timeout_ms,
+                 "Per-request timeout, enqueue to response")
       ->capture_default_str();
 
   CLI11_PARSE(app, argc, argv);
@@ -94,49 +87,41 @@ int main(int argc, char** argv) {
   auto* logger = quill::Frontend::create_or_get_logger("root", std::move(sink));
 
   try {
-    auto loop_backend = [&] {
-      if (io_backend == "io_uring") {
-        return vkp::io::make_backend(vkp::io::backend_kind::io_uring);
-      }
-      if (io_backend == "epoll") {
-        return vkp::io::make_backend(vkp::io::backend_kind::epoll);
-      }
-      if (io_backend == "kqueue") {
-        return vkp::io::make_backend(vkp::io::backend_kind::kqueue);
-      }
-      return vkp::io::make_backend();
-    }();
-    vkp::io::event_loop loop{std::move(loop_backend)};
-
-    vkp::proxy::config cfg;
-    std::tie(cfg.listen_host, cfg.listen_port) = parse_endpoint(listen_ep);
-    std::tie(cfg.backend_host, cfg.backend_port) = parse_endpoint(backend_ep);
-
-    vkp::proxy::server server{loop, cfg};
-
-    // Signal plumbing before start(): SIGTERM/SIGINT drain, repeat forces.
-    (void)std::signal(SIGPIPE, SIG_IGN);
-    int sv[2] = {-1, -1};
-    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
-      throw std::system_error(errno, std::generic_category(), "socketpair");
+    vkp::proxy::worker_pool::options opt;
+    std::tie(opt.cfg.listen_host, opt.cfg.listen_port) = parse_endpoint(listen_ep);
+    std::tie(opt.cfg.backend_host, opt.cfg.backend_port) = parse_endpoint(backend_ep);
+    opt.cfg.conns_per_backend = conns_per_backend;
+    opt.cfg.backend.request_timeout = std::chrono::milliseconds{request_timeout_ms};
+    opt.workers = workers;
+    opt.cpu_affinity = cpu_affinity;
+    if (io_backend == "io_uring") {
+      opt.io_backend = vkp::io::backend_kind::io_uring;
+    } else if (io_backend == "epoll") {
+      opt.io_backend = vkp::io::backend_kind::epoll;
+    } else if (io_backend == "kqueue") {
+      opt.io_backend = vkp::io::backend_kind::kqueue;
     }
-    g_signal_fd = sv[1];
-    (void)::fcntl(sv[0], F_SETFL, ::fcntl(sv[0], F_GETFL, 0) | O_NONBLOCK);
-    (void)::fcntl(sv[1], F_SETFL, ::fcntl(sv[1], F_GETFL, 0) | O_NONBLOCK);
+
+    vkp::proxy::worker_pool pool{opt};
+
+    // Signal plumbing before run(): SIGTERM/SIGINT drain, repeat forces.
+    (void)std::signal(SIGPIPE, SIG_IGN);
+    const auto& fds = pool.shutdown_fds();
+    g_signal_fd_count = static_cast<int>(std::min<std::size_t>(fds.size(), kMaxWorkers));
+    for (int i = 0; i < g_signal_fd_count; ++i) {
+      g_signal_fds[i] = fds[static_cast<std::size_t>(i)];
+    }
     (void)std::signal(SIGTERM, on_signal);
     (void)std::signal(SIGINT, on_signal);
 
-    server.start();
-    vkp::io::spawn(signal_watcher(loop, server, sv[0], logger));
+    LOG_INFO(logger,
+             "valkey-proxy {} listening on {}:{} -> backend {}:{} "
+             "({} worker(s), {} conn(s)/backend, io: {})",
+             vkp::kVersion, opt.cfg.listen_host, pool.port(), opt.cfg.backend_host,
+             opt.cfg.backend_port, pool.workers(), conns_per_backend, pool.io_backend_name());
 
-    LOG_INFO(logger, "valkey-proxy {} listening on {}:{} -> backend {}:{} (io: {})", vkp::kVersion,
-             cfg.listen_host, server.port(), cfg.backend_host, cfg.backend_port,
-             loop.backend_name());
+    pool.run();
 
-    loop.run();
-
-    ::close(sv[0]);
-    ::close(sv[1]);
     LOG_INFO(logger, "shutdown complete");
   } catch (const std::exception& e) {
     LOG_ERROR(logger, "fatal: {}", e.what());

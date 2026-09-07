@@ -9,6 +9,7 @@ add_library(vkp_lib STATIC
   proxy/backend_conn.cpp
   proxy/command_table.cpp
   proxy/server.cpp
+  proxy/worker_pool.cpp
   resp/parser.cpp
   resp/serializer.cpp
   resp/value.cpp
