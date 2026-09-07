@@ -372,7 +372,7 @@ TEST_CASE("proxy reconnects after the backend comes back", "[proxy]") {
     }
     CHECK(ok == "+PONG\r\n");
     s.begin_shutdown();
-    lst.release();  // acceptor coroutine still holds the raw fd; loop stop reaps it
+    (void)lst.release();  // acceptor coroutine still holds the raw fd; loop stop reaps it
   }(loop, srv, port));
 
   loop.run();

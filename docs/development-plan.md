@@ -18,10 +18,10 @@
 | M0 | 工程骨架 | 可构建、可测试、CI 全绿的空项目 | ✅ 完成（2026-08-24, `9b19060`） |
 | M1 | RESP 协议解析器 | 经 fuzz 验证的零拷贝 RESP2/3 解析与序列化库 | ✅ 完成（2026-08-24） |
 | M2 | 事件循环 + 最小可用 proxy | `valkey-cli` 可通过 proxy 访问单个后端 | ✅ 完成（2026-08-31） |
-| M3 | 多线程 + 连接池 + pipelining | 可承受多连接压测的生产形态骨架 |
-| M4 | cluster 路由 | 对接 valkey cluster，处理 MOVED/ASK |
-| M5 | 可观测性与配置 | metrics / 日志 / 配置 / 优雅关闭 |
-| M6 | 性能打磨 | 基线固化与针对性优化 |
+| M3 | 多线程 + 连接池 + pipelining | 可承受多连接压测的生产形态骨架 | ✅ 完成（2026-09-07） |
+| M4 | cluster 路由 | 对接 valkey cluster，处理 MOVED/ASK | |
+| M5 | 可观测性与配置 | metrics / 日志 / 配置 / 优雅关闭 | |
+| M6 | 性能打磨 | 基线固化与针对性优化 | |
 
 依赖关系：M1 与 M2 可部分并行（M1 不依赖任何 IO 代码）；其余按序进行。
 
@@ -190,7 +190,9 @@
 
 ---
 
-## M3 — 多线程 + 连接池 + pipelining
+## M3 — 多线程 + 连接池 + pipelining ✅
+
+**状态**：已完成（2026-09-07）。设计文档：[docs/design/m3-workers-pool-pipelining.md](design/m3-workers-pool-pipelining.md)。
 
 **目标**：从玩具变成生产形态骨架：多 worker、后端连接复用、流水线保序。
 
@@ -207,6 +209,98 @@
 6. **背压**：客户端读入速率与后端写出能力挂钩（in-flight 上限，超过暂停读客户端）。
 
 **验收标准**：`valkey-benchmark -c 50 -P 16` 与 memtier 混合读写压测正确通过；对比直连记录延迟损耗（P50/P99）并写入 docs 作为基线；TSan 压测无数据竞争报告。
+
+**实施记录（与计划的偏差）**：
+
+- 分层落地：`worker_pool`（线程 + 亲和性 + 关停扇出）→ 每 worker 一个 `event_loop`
+  + 一个 `proxy::server`（listen/accept/客户端连接）→ 每 worker N 条
+  `backend_conn`（后端长连接 + in-flight FIFO + 三个常驻协程）。worker 之间零共享，
+  没有一处跨线程可变状态。
+- **超时不用 `IORING_OP_LINK_TIMEOUT`（计划偏差，见设计文档 §3）**：LINK_TIMEOUT 只有
+  io_uring 有，reactor 后端仍得写第二套超时路径。改为每条后端连接一个 watchdog 协程，
+  睡到「队首请求的 deadline」而不是每请求挂一个定时器——热路径上每请求零额外 op、零
+  定时器堆插入，三个后端共用一条代码路径。连接超时、请求超时、空闲健康检查 PING 都由
+  这一个协程调度。
+- **`worker_pool` 构造期就建好全部 loop/server**，`run()` 只负责起线程。这样
+  `--listen :0`（临时端口）能工作：worker 0 先 bind 拿到端口号再共享给其余 worker，
+  否则 SO_REUSEPORT 下每个 worker 会各绑一个不同端口。
+- **默认 worker 数是 1，不是物理核数（计划偏差）**：M3 还没有多后端/路由，默认多线程
+  只会在单条 valkey 上放大竞争，收益不明。`-w 0` 显式取 `hardware_concurrency()`。
+  M4 有了 cluster 路由后再考虑改默认值。
+- **HELLO/QUIT/SELECT/RESET 改为本地应答（`cmd_policy::local`，改变了 M2 的整条透传
+  行为）**：后端连接是所有客户端共用的，任何改变连接状态的命令都不能透传。HELLO 由
+  proxy 自己回握手（RESP2 `*14` / RESP3 `%7`，`server` 字段为 `valkey-proxy`），
+  `HELLO AUTH` 回 `-ERR proxy: AUTH not supported`，SELECT 只接受 db 0。
+- **本地应答与拒绝应答进同一条 FIFO**（`entry.local`）而不是直接写回客户端，否则
+  pipeline 里 `GET / SUBSCRIBE / GET` 的错误会插到两个 GET 响应之前。
+- **客户端中途死掉用打墓碑（`sink = nullptr`）而不是从队列里摘除**——摘除会打乱后端
+  连接上的 FIFO 对齐，后续所有客户端都会收到错位的响应。
+- **cancel-before-close 是硬性纪律**：绝不 `close()` 一个还有在途 op 的 fd（reactor
+  后端的 slot 会变悬空指针）。后端连接重建时先 cancel → 等 writer 协程从被取消的 send
+  里返回并 notify → 才 `fd_.reset()`。
+- **`wait_queue`（异步条件变量）必须在 event_loop 上注册**：否则「循环空转 + 只剩挂起
+  的 waiter」时，既没人能 notify 它们，`run()` 又不肯退出，结果是协程帧泄漏 + 挂死。
+  现在 `stop()` 与「idle 且无任何可完成事件」两处都会把挂起 waiter 统一以
+  `-ECANCELED` 唤醒。
+- **教训：交给 event_loop 的每一个 fd 都必须是非阻塞的**——worker_pool 测试里
+  socketpair 的读端忘了设 `O_NONBLOCK`，kqueue 后端直接阻塞在 `recvfrom` 里，
+  表现为 ctest 整体超时挂死（用 macOS `sample` 抓栈才定位到）。
+- 测试规模：61 用例 / 2664 断言。新增 `wait_queue`、`byte_queue`、命令表、
+  worker_pool 单测，`proxy_test` 重写为可编排的假后端（echo/silent/first_then_close），
+  覆盖双客户端交错 pipeline 保序、拒绝应答插入位置、HELLO/SELECT/RESET/QUIT 语义、
+  后端不可达、请求超时、pipeline 中途后端猝死、自动重连、`max_inflight=1` 深 pipeline、
+  健康检查 PING。
+
+**验收实测**（Linux 容器 aarch64 / OrbStack 内核 7.0 / 18 vCPU，clang-18；后端为
+同机 redis-server 7.0.15，`--save "" --appendonly no`）：
+
+- 构建矩阵全绿：clang-18 Debug、GCC-14 Debug、ASan+UBSan、TSan，各 61/61 通过；
+  io_uring 与 epoll 两条路径都跑到（IO 层测试按 `available_backends()` 参数化）。
+- **TSan 压测无任何报告**（验收项）：4 worker × 2 条后端连接，
+  `redis-benchmark -c 50 -P 16 -n 500000` + 11 种命令的非 pipeline 混合压测，
+  合计约 210 万次操作，零 ThreadSanitizer 报告，SIGTERM 正常收尾。
+- **混沌压测**：压测运行中连杀后端 3 次，在途请求按预期收到
+  `-ERR proxy: backend connection lost`，指数退避重连后 PING/SET/GET 全部恢复；
+  TSan 同样零报告。
+- ASan+UBSan（含 `detect_leaks=1`）实流量压测 + 本地/拒绝命令路径：零报告、零泄漏。
+
+**性能基线（验收项）**：`redis-benchmark -c 50 -d 32 --threads 4`，
+`-P 1` 取 n=100 万、`-P 16` 取 n=500 万（跑短了 rps 会被计时精度量化，早先 n=30 万的
+一轮四个配置全都读出「1.2M rps」就是这个原因）。延迟单位毫秒。
+
+| 配置 | 命令 | P | rps | p50 | p95 | p99 |
+|---|---|---|---|---|---|---|
+| 直连 | SET | 1 | 399,840 | 0.103 | 0.151 | 0.191 |
+| 直连 | GET | 1 | 363,504 | 0.103 | 0.215 | 0.431 |
+| 直连 | SET | 16 | 2,855,511 | 0.207 | 0.303 | 0.479 |
+| 直连 | GET | 16 | 3,331,112 | 0.191 | 0.303 | 0.423 |
+| proxy io_uring w4 c1 | SET | 1 | 307,409 | 0.135 | 0.239 | 0.303 |
+| proxy io_uring w4 c1 | GET | 1 | 307,503 | 0.135 | 0.239 | 0.303 |
+| proxy io_uring w4 c1 | SET | 16 | 2,498,751 | 0.263 | 0.479 | 0.591 |
+| proxy io_uring w4 c1 | GET | 16 | 2,853,881 | 0.239 | 0.439 | 0.543 |
+| proxy io_uring w4 c2 | SET | 16 | 2,497,502 | 0.279 | 0.511 | 0.631 |
+| proxy io_uring w4 c2 | GET | 16 | 2,498,751 | 0.263 | 0.471 | 0.591 |
+| proxy epoll w4 c1 | SET | 16 | 1,998,401 | 0.327 | 0.591 | 0.719 |
+| proxy epoll w4 c1 | GET | 16 | 2,220,248 | 0.295 | 0.535 | 0.655 |
+| proxy io_uring w1 c1 | SET | 16 | 2,219,263 | 0.311 | 0.375 | 0.447 |
+| proxy io_uring w1 c1 | GET | 16 | 1,997,603 | 0.335 | 0.463 | 0.487 |
+
+  解读（以 io_uring / 4 worker / 1 条后端连接为准）：
+  - **`-P 16`（验收配置）**：p50 +0.05 ms、p99 +0.11 ms，吞吐为直连的 86~88%。
+    相对增幅 p50 +25%、p99 +23%，落在「P99 相对直连增加 ≤ 30%」的区间里。
+  - **`-P 1`**：p50 +0.032 ms（一次额外的 loopback 往返 + 一次解析），吞吐为直连的
+    77~85%。绝对增量 ~32 µs 是这套架构在无 pipeline 下的固定代价，M6 优化的对照起点。
+  - **epoll 比 io_uring 慢 12~22%**（同为 4 worker，`-P 16`），符合预期：reactor
+    路径每次 IO 多一次 `epoll_pwait2` 往返 + 一次非阻塞 syscall。
+  - **`conns_per_backend=2` 没有收益**（`-P 16` 下反而 p50 +0.02 ms）：后端是单线程
+    redis，多开一条连接只是把同样的请求拆成两条队列，还多一份 syscall。默认保持 1，
+    该选项留给 M4 多后端/慢命令隔离场景。
+  - w1 与 w4 在 `-P 16` 下吞吐接近（2.0~2.2M vs 2.5~2.9M），瓶颈已在单线程后端，
+    不是 proxy。
+
+**未做**：memtier 混合读写压测。memtier_benchmark 不在 Ubuntu 源里，本机也没有，
+需要从源码构建；`redis-benchmark` 已覆盖 `-c 50 -P 16` 与 11 种命令的混合读写，
+memtier 作为补充留到 M4 集成测试环境一并搭。
 
 ---
 
@@ -258,7 +352,12 @@
    - 协程帧内存池调优（复用率统计、尺寸分级）
    - RESP 解析器热点优化（memchr 向量化查找 CRLF 等）
    - recv bundle（内核 6.10+，探测启用）
-4. **目标设定**：以 M3 记录的基线为准，定量目标在基线出来后回填本文档（例如：P99 相对直连增加 ≤ 30%，单核 QPS ≥ 直连单实例的 X%）。
+4. **目标设定**（以 M3 基线为对照，见 M3 章「性能基线」；同一环境同一命令行复跑）：
+   - `-c 50 -P 16`：M3 实测 p50 +25% / p99 +23%、吞吐为直连 86~88%。目标 p99 相对
+     直连增加 **≤ 15%**，吞吐 **≥ 直连 92%**。
+   - `-c 50 -P 1`：M3 实测每请求固定增量 ~32 µs（p50 0.103 → 0.135 ms），吞吐为直连
+     77~85%。目标固定增量 **≤ 20 µs**，吞吐 **≥ 直连 90%**。
+   - epoll 路径：M3 实测比 io_uring 慢 12~22%，不设优化目标，只要求不退化。
 
 **验收标准**：报告展示每项优化的前后对比；最终数字写入 README。
 
