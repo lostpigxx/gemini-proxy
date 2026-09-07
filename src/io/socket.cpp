@@ -38,6 +38,12 @@ void set_tcp_nodelay(int fd) noexcept {
   (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
+void setup_stream_socket(int fd) noexcept {
+  (void)::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+  (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+  set_common_options(fd);
+}
+
 void unique_fd::reset() noexcept {
   if (fd_ >= 0) {
     ::close(fd_);

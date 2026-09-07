@@ -45,6 +45,14 @@ class byte_queue {
     sending_.clear();
   }
 
+  // Drops all buffered bytes. Only legal with no send batch in progress
+  // (connection teardown after the writer has parked).
+  void clear() noexcept {
+    assert(!sending_active_);
+    pending_.clear();
+    sending_.clear();
+  }
+
  private:
   std::vector<char> pending_;
   std::vector<char> sending_;

@@ -59,6 +59,11 @@ struct resolved_addr {
 // pipelining client stall on Nagle + delayed ACK (~40 ms per batch).
 void set_tcp_nodelay(int fd) noexcept;
 
+// Everything a proxy data socket needs: nonblocking + cloexec + TCP_NODELAY
+// (+ SO_NOSIGPIPE on macOS). For fds created with raw ::socket(); accepted
+// fds are already nonblocking/cloexec but calling this again is harmless.
+void setup_stream_socket(int fd) noexcept;
+
 // Nonblocking connected TCP socket with TCP_NODELAY set.
 // Throws std::system_error on failure (including -ECANCELED during stop()).
 [[nodiscard]] task<unique_fd> connect_tcp(event_loop& loop, resolved_addr addr);
