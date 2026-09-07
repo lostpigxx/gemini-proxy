@@ -9,16 +9,22 @@
 
 #include <cassert>
 #include <cstddef>
+#include <string>
 #include <string_view>
-#include <vector>
 
 namespace vkp {
 
 class byte_queue {
  public:
+  byte_queue() = default;
+  // Non-movable: begin_send()'s view may point into a short string's inline
+  // buffer, which lives inside this object.
+  byte_queue(const byte_queue&) = delete;
+  byte_queue& operator=(const byte_queue&) = delete;
+
   // Appends to the pending half; always safe, never invalidates the view
   // returned by begin_send().
-  void append(std::string_view data) { pending_.insert(pending_.end(), data.begin(), data.end()); }
+  void append(std::string_view data) { pending_.append(data); }
 
   // True when there is nothing pending and no send batch is in progress.
   [[nodiscard]] bool empty() const noexcept { return pending_.empty() && !sending_active_; }
@@ -54,8 +60,12 @@ class byte_queue {
   }
 
  private:
-  std::vector<char> pending_;
-  std::vector<char> sending_;
+  // std::string, not vector<char>: GCC 14 at -O2 emits a false-positive
+  // -Wstringop-overflow/-Warray-bounds for vector<char>::insert inlined at a
+  // call site where it can fold the vector to empty ("destination object is
+  // likely at address zero"). A string's buffer is never null.
+  std::string pending_;
+  std::string sending_;
   bool sending_active_ = false;
 };
 

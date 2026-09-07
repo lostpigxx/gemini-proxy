@@ -1,5 +1,6 @@
 #include "proxy/worker_pool.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
 #include <string>
@@ -8,6 +9,7 @@
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -54,6 +56,25 @@ io::task<void> shutdown_watcher(io::event_loop& loop, server& srv, int fd) {
 void set_nonblocking(int fd) {
   (void)::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
   (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+
+// Pins worker i to CPU i % ncpu. No-op off Linux — but still a call, so the
+// flag is read on every platform (an #if around the call site instead would
+// make cpu_affinity_ an unused private field on macOS).
+void pin_threads([[maybe_unused]] bool enabled,
+                 [[maybe_unused]] std::vector<std::thread>& threads) {
+#if defined(__linux__)
+  if (!enabled) {
+    return;
+  }
+  const unsigned ncpu = std::max(1U, std::thread::hardware_concurrency());
+  for (std::size_t i = 0; i < threads.size(); ++i) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(i % ncpu, &set);
+    (void)pthread_setaffinity_np(threads[i].native_handle(), sizeof(set), &set);
+  }
+#endif
 }
 
 }  // namespace
@@ -124,17 +145,7 @@ void worker_pool::run() {
     });
   }
 
-#if defined(__linux__)
-  if (cpu_affinity_) {
-    const unsigned ncpu = std::max(1U, std::thread::hardware_concurrency());
-    for (std::size_t i = 0; i < threads.size(); ++i) {
-      cpu_set_t set;
-      CPU_ZERO(&set);
-      CPU_SET(i % ncpu, &set);
-      (void)pthread_setaffinity_np(threads[i].native_handle(), sizeof(set), &set);
-    }
-  }
-#endif
+  pin_threads(cpu_affinity_, threads);
 
   for (std::thread& t : threads) {
     t.join();
