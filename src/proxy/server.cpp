@@ -1,7 +1,10 @@
 #include "proxy/server.hpp"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <deque>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -100,7 +103,15 @@ std::string handle_local(const resp::message_view& msg, const command_info& info
 
 // One client connection: a reader (frames → command table → backend queue)
 // and a writer (flushes the outbound byte queue). Replies arrive via
-// deliver() from the bound backend connection's driver.
+// deliver() from a backend connection's driver.
+//
+// This class is the sole ordering authority (design m4 §1). Every request
+// read takes the next token and pushes a reply slot; a reply fills its slot
+// and only the contiguous filled prefix is flushed. Proxy-generated replies
+// fill their own slot the same way, so they need no help from the backend
+// FIFO. Today all requests still go to one backend and arrive in order, so
+// the deque is almost always length-1 at the head — but the invariant is what
+// lets cluster routing fan a client out across nodes.
 class client_conn final : public reply_sink {
  public:
   client_conn(io::event_loop& loop, io::unique_fd fd, backend_conn& conn, std::size_t outbuf_limit)
@@ -122,7 +133,7 @@ class client_conn final : public reply_sink {
       // Client stopped sending (EOF/QUIT/error): deliver what it is still
       // owed before closing. Bounded by the request timeout — a dead
       // backend fails the queue, which drains us too.
-      while (pending_replies_ > 0 && !aborting_) {
+      while (!slots_.empty() && !aborting_) {
         if (co_await drained_.wait() < 0) {
           break;
         }
@@ -136,14 +147,31 @@ class client_conn final : public reply_sink {
     conn_.detach(*this);
   }
 
-  void deliver(std::string_view frame) override {
+  void deliver(std::uint64_t token, std::string_view frame) override {
     if (aborting_) {
       return;
     }
-    if (pending_replies_ > 0 && --pending_replies_ == 0) {
+    const auto index = static_cast<std::size_t>(token - head_token_);
+    if (index >= slots_.size()) {
+      return;  // already flushed or abandoned; nothing to fill
+    }
+    if (index != 0) {
+      // Out of order: park it and wait for the earlier slots.
+      slots_[index].filled = true;
+      slots_[index].reply.assign(frame);
+      return;
+    }
+    // The head: goes straight out, skipping the intermediate string. Any
+    // followers that arrived early become sendable with it.
+    out_.append(frame);
+    pop_head();
+    while (!slots_.empty() && slots_.front().filled) {
+      out_.append(slots_.front().reply);
+      pop_head();
+    }
+    if (slots_.empty()) {
       drained_.notify_all();
     }
-    out_.append(frame);
     if (out_.size() > outbuf_limit_) {
       abort_now();  // slow client: cut it loose instead of buffering forever
       return;
@@ -152,6 +180,27 @@ class client_conn final : public reply_sink {
   }
 
  private:
+  struct reply_slot {
+    bool filled = false;
+    std::string reply;  // only populated when the reply arrived out of order
+  };
+
+  // Takes the next token and reserves its place in the output order.
+  // Invariant: next_token_ == head_token_ + slots_.size().
+  std::uint64_t new_slot() {
+    slots_.emplace_back();
+    return next_token_++;
+  }
+
+  void pop_head() noexcept {
+    slots_.pop_front();
+    ++head_token_;
+  }
+
+  // A reply the proxy produced itself. It takes a slot like any other so it
+  // lands in the right place among pipelined requests.
+  void reply_now(std::string_view reply) { deliver(new_slot(), reply); }
+
   io::task<void> reader() {
     read_buffer in;
     resp::parser parser;
@@ -161,7 +210,7 @@ class client_conn final : public reply_sink {
         co_return;
       }
       if (fr.k == frame_result::kind::protocol_error) {
-        enqueue_local_reply(fmt::format("-ERR Protocol error: {}\r\n", resp::to_string(fr.perr)));
+        reply_now(fmt::format("-ERR Protocol error: {}\r\n", resp::to_string(fr.perr)));
         co_return;
       }
       if (fr.k != frame_result::kind::frame) {
@@ -170,27 +219,26 @@ class client_conn final : public reply_sink {
 
       const resp::message_view& msg = parser.message();
       if (!msg.is_command) {
-        enqueue_local_reply("-ERR Protocol error: expected a command\r\n");
+        reply_now("-ERR Protocol error: expected a command\r\n");
         co_return;
       }
       bool close_after = false;
       const command_info* info = find_command(msg.args[0]);
       const cmd_policy policy = info != nullptr ? info->policy : cmd_policy::forward;
       if (policy == cmd_policy::reject) {
-        enqueue_local_reply(fmt::format("-ERR unsupported by proxy: {}\r\n", info->name));
+        reply_now(fmt::format("-ERR unsupported by proxy: {}\r\n", info->name));
       } else if (policy == cmd_policy::local) {
-        enqueue_local_reply(handle_local(msg, *info, close_after));
+        reply_now(handle_local(msg, *info, close_after));
       } else {
         // Backpressure: wait for queue capacity; the client socket goes
         // unread meanwhile, so TCP pushes back upstream (design §2.5).
         for (;;) {
           if (!conn_.available()) {
-            enqueue_local_reply(std::string{kErrBackendUnavailable});
+            reply_now(kErrBackendUnavailable);
             break;
           }
           if (conn_.has_capacity()) {
-            ++pending_replies_;
-            conn_.enqueue_forward(*this, msg.raw);
+            conn_.enqueue_forward(*this, new_slot(), msg.raw);
             break;
           }
           if (co_await conn_.capacity_event().wait() < 0 || aborting_) {
@@ -234,11 +282,6 @@ class client_conn final : public reply_sink {
     writer_done_.notify_all();
   }
 
-  void enqueue_local_reply(std::string reply) {
-    ++pending_replies_;  // before enqueue: delivery may be synchronous
-    conn_.enqueue_local(*this, std::move(reply));
-  }
-
   void abort_now() noexcept {
     if (aborting_) {
       return;
@@ -258,7 +301,9 @@ class client_conn final : public reply_sink {
   std::size_t outbuf_limit_;
 
   byte_queue out_;
-  std::size_t pending_replies_ = 0;
+  std::deque<reply_slot> slots_;
+  std::uint64_t next_token_ = 0;
+  std::uint64_t head_token_ = 0;  // the token of slots_.front()
   bool aborting_ = false;
   bool closing_ = false;
   bool writer_live_ = false;

@@ -6,7 +6,6 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
-#include <string>
 #include <string_view>
 
 #include "core/buffer.hpp"
@@ -27,9 +26,15 @@ inline constexpr std::string_view kErrTimeout = "-ERR proxy timeout\r\n";
 // Where a paired response goes. Implemented by the client connection;
 // deliver() must only buffer (never block, never destroy the sink
 // synchronously) — it is called from the backend connection's driver.
+//
+// `token` is the value the sink handed to enqueue_forward(). Under cluster
+// routing one client's requests fan out to several connections, so responses
+// come back with no ordering relation between them; the token lets the sink
+// put them back in request order (design m4 §1). This connection itself stays
+// completely unaware of the ordering — it only echoes the token back.
 class reply_sink {
  public:
-  virtual void deliver(std::string_view frame) = 0;
+  virtual void deliver(std::uint64_t token, std::string_view frame) = 0;
 
  protected:
   ~reply_sink() = default;
@@ -85,14 +90,9 @@ class backend_conn {
   [[nodiscard]] io::wait_queue& capacity_event() noexcept { return capacity_; }
 
   // Copies `frame` into the outbound queue and appends a FIFO pairing entry.
-  // Pre: available() && has_capacity(). `sink` must stay valid until
-  // delivery or detach().
-  void enqueue_forward(reply_sink& sink, std::string_view frame);
-
-  // Appends a proxy-generated reply into the same FIFO so it is delivered
-  // in order with surrounding forwarded requests (design §2.2). Always
-  // allowed; delivers immediately when it lands at the queue head.
-  void enqueue_local(reply_sink& sink, std::string reply);
+  // The response comes back as sink.deliver(token, ...). Pre: available() &&
+  // has_capacity(). `sink` must stay valid until delivery or detach().
+  void enqueue_forward(reply_sink& sink, std::uint64_t token, std::string_view frame);
 
   // Tombstones every queued entry pointing at `sink` (client went away;
   // entries must stay for pairing, their responses are discarded).
@@ -110,11 +110,13 @@ class backend_conn {
  private:
   enum class state : std::uint8_t { down, connecting, connected };
 
+  // A pure transport queue: every entry consumes exactly one backend frame.
+  // Proxy-generated replies never enter here — the client orders those itself
+  // through its own reply slots (design m4 §1).
   struct entry {
     reply_sink* sink;  // nullptr: discard (internal health PING / tombstone)
-    bool local;        // deliver `local_reply` without consuming a backend frame
-    std::string local_reply;
-    std::chrono::steady_clock::time_point deadline;  // forward entries only
+    std::uint64_t token;
+    std::chrono::steady_clock::time_point deadline;
   };
 
   io::task<void> driver();    // reconnect loop + response reader/pairing
@@ -125,7 +127,6 @@ class backend_conn {
   io::task<bool> backoff_wait();    // false: drain/stop, exit the driver loop
   void teardown_session() noexcept;
   void deliver_head(std::string_view frame);
-  void drain_local_heads();
   void fail_all() noexcept;
   void poke_watchdog() noexcept;
 

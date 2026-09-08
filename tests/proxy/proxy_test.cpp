@@ -402,6 +402,34 @@ TEST_CASE("deep pipeline under max_inflight=1 stays correct", "[proxy]") {
   CHECK(out == expect);
 }
 
+TEST_CASE("locally answered replies wait behind the forwarded ones", "[proxy]") {
+  io::event_loop loop;
+  io::unique_fd fake_lst = io::listen_tcp("127.0.0.1", 0);
+  io::spawn(fake_acceptor(loop, fake_lst.get(), {}));
+
+  proxy::config cfg = test_config(io::local_port(fake_lst.get()));
+  cfg.backend.max_inflight = 1;  // forwarded replies trickle back one at a time
+  proxy::server srv{loop, cfg};
+  srv.start();
+  countdown cd{.n = 1, .srv = &srv};
+
+  // RESET and the rejection are produced the moment the reader sees them,
+  // while the ECHO ahead of them is still on the wire. Only the client's
+  // reply slots put the three back into request order.
+  std::string payload;
+  std::string expect;
+  for (int i = 0; i < 8; ++i) {
+    payload += echo_cmd(fmt::format("v{}", i)) + "*1\r\n$5\r\nRESET\r\n" + "*1\r\n$5\r\nMULTI\r\n";
+    expect +=
+        echo_reply(fmt::format("v{}", i)) + "+RESET\r\n" + "-ERR unsupported by proxy: MULTI\r\n";
+  }
+  std::string out;
+  io::spawn(
+      client_script(loop, srv.port(), payload, expect.size(), false, out, [&cd] { cd.done(); }));
+  loop.run();
+  CHECK(out == expect);
+}
+
 TEST_CASE("idle backend connections get health-check PINGs", "[proxy]") {
   io::event_loop loop;
   io::unique_fd fake_lst = io::listen_tcp("127.0.0.1", 0);

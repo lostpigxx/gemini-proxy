@@ -59,24 +59,17 @@ void backend_conn::start() {
   io::spawn(watchdog());
 }
 
-void backend_conn::enqueue_forward(reply_sink& sink, std::string_view frame) {
+void backend_conn::enqueue_forward(reply_sink& sink, std::uint64_t token, std::string_view frame) {
   assert(available() && has_capacity());
   const bool was_empty = inflight_.empty();
   const auto now = std::chrono::steady_clock::now();
   out_.append(frame);
-  inflight_.push_back(
-      {.sink = &sink, .local = false, .local_reply = {}, .deadline = now + cfg_.request_timeout});
+  inflight_.push_back({.sink = &sink, .token = token, .deadline = now + cfg_.request_timeout});
   last_activity_ = now;
   out_ready_.notify_one();
   if (was_empty) {
     poke_watchdog();  // switch from idle/health timing to the head deadline
   }
-}
-
-void backend_conn::enqueue_local(reply_sink& sink, std::string reply) {
-  inflight_.push_back(
-      {.sink = &sink, .local = true, .local_reply = std::move(reply), .deadline = {}});
-  drain_local_heads();  // delivers immediately when it landed at the head
 }
 
 void backend_conn::detach(reply_sink& sink) noexcept {
@@ -110,27 +103,16 @@ void backend_conn::poke_watchdog() noexcept {
 }
 
 void backend_conn::deliver_head(std::string_view frame) {
-  entry e = std::move(inflight_.front());
+  const entry e = inflight_.front();
   inflight_.pop_front();
   if (e.sink != nullptr) {
-    e.sink->deliver(frame);
+    e.sink->deliver(e.token, frame);
   }
   last_activity_ = std::chrono::steady_clock::now();
-  drain_local_heads();
   if (inflight_.empty()) {
     poke_watchdog();  // switch from the (stale) head deadline to idle timing
   }
   capacity_.notify_all();
-}
-
-void backend_conn::drain_local_heads() {
-  while (!inflight_.empty() && inflight_.front().local) {
-    entry e = std::move(inflight_.front());
-    inflight_.pop_front();
-    if (e.sink != nullptr) {
-      e.sink->deliver(e.local_reply);
-    }
-  }
 }
 
 void backend_conn::fail_all() noexcept {
@@ -138,17 +120,13 @@ void backend_conn::fail_all() noexcept {
   const std::string_view fwd_error =
       session_was_connected_ ? kErrBackendLost : kErrBackendUnavailable;
   while (!inflight_.empty()) {
-    entry e = std::move(inflight_.front());
+    const entry e = inflight_.front();
     inflight_.pop_front();
     if (e.sink == nullptr) {
       continue;
     }
-    if (e.local) {
-      e.sink->deliver(e.local_reply);
-    } else {
-      const bool timed = head_timed_out_ && e.deadline <= now;
-      e.sink->deliver(timed ? kErrTimeout : fwd_error);
-    }
+    const bool timed = head_timed_out_ && e.deadline <= now;
+    e.sink->deliver(e.token, timed ? kErrTimeout : fwd_error);
   }
   head_timed_out_ = false;
   capacity_.notify_all();
@@ -170,7 +148,7 @@ io::task<void> backend_conn::read_responses() {
     if (r.k != frame_result::kind::frame) {
       co_return;  // eof / io error / -ECANCELED (timeout kill, drain) / garbage
     }
-    if (inflight_.empty() || inflight_.front().local) {
+    if (inflight_.empty()) {
       co_return;  // unsolicited frame: backend out of sync, rebuild
     }
     deliver_head(in_.readable().substr(0, r.len));
@@ -361,10 +339,8 @@ io::task<void> backend_conn::watchdog() {
           // Internal PING: paired FIFO like any request, response discarded;
           // its timeout rides the regular request path.
           out_.append(kHealthPing);
-          inflight_.push_back({.sink = nullptr,
-                               .local = false,
-                               .local_reply = {},
-                               .deadline = fired + cfg_.request_timeout});
+          inflight_.push_back(
+              {.sink = nullptr, .token = 0, .deadline = fired + cfg_.request_timeout});
           last_activity_ = fired;
           out_ready_.notify_one();
         }

@@ -54,6 +54,12 @@ forward 请求不排队等重连，直接回 `-ERR proxy: backend unavailable`�
 客户端先死：不能从 FIFO 中间抽走 entry（会错位），把该客户端的 entry 打墓碑
 （client 置空），响应到达后丢弃。
 
+> **M4 起本节规则 1、2 已被取代**——cluster 路由下同一客户端的请求会落到不同节点，
+> 「一客户端一后端连接」不再成立。定序权威移到 `client_conn` 自己的有序回复槽位
+> （单调 token + 只刷连续前缀），`kind=local` / `local_reply` / `drain_local_heads`
+> 整套机制随之删除，`backend_conn` 退化成纯传输层（每个 entry 恰好消耗一帧）。
+> 见 [m4-cluster-routing.md](m4-cluster-routing.md) §1。
+
 ### 2.3 客户端连接
 
 每客户端两个协程：reader（读帧→查命令表→入队/本地回复）与 writer（刷自己的出向
