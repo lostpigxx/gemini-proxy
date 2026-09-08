@@ -1,5 +1,6 @@
 # Core library: everything except main(), shared by proxyd/tests/benchmarks/fuzzers.
 add_library(vkp_lib STATIC
+  cluster/topology.cpp
   core/buffer.cpp
   io/backend.cpp
   io/event_loop.cpp
