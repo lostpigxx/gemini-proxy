@@ -1,6 +1,7 @@
 include(Catch)
 
 add_executable(vkp_tests
+  cluster/slot_test.cpp
   core/smoke_test.cpp
   core/buffer_test.cpp
   core/byte_queue_test.cpp
