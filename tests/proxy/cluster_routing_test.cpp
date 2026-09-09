@@ -80,6 +80,7 @@ struct fake_node {
       const auto& msg = parser.message();
       const std::string_view key = msg.args.size() >= 2 ? msg.args[1] : std::string_view{};
       std::string reply;
+      bool is_data = false;
       if (msg.args[0] == "CLUSTER") {
         // Always a reply, even for a node with no canned topology: a silent
         // node would desync this connection's FIFO pairing.
@@ -91,10 +92,15 @@ struct fake_node {
         ++asking;
         reply = "+OK\r\n";
       } else {
+        is_data = true;
         seen.emplace_back(key);
         reply = (key == redirect_key && redirect_budget-- > 0) ? redirect : tag;
       }
       buf.consume(msg.raw.size());
+      // Data only: delaying the bootstrap would just slow every test down.
+      if (is_data && delay > 0ms && co_await loop.sleep_for(delay) < 0) {
+        co_return;
+      }
       if (co_await io::send_all(loop, fd.get(), reply) != 0) {
         co_return;
       }
@@ -110,6 +116,7 @@ struct fake_node {
   std::string redirect_key;
   std::string redirect;
   int redirect_budget = 0;
+  std::chrono::milliseconds delay{0};  // held back before answering a data command
   int asking = 0;
   std::vector<std::string> seen;
 };
@@ -150,8 +157,30 @@ std::string shards_frame(std::initializer_list<range> ranges) {
   return out;
 }
 
+std::string cmd(std::initializer_list<std::string_view> args) {
+  std::string out = fmt::format("*{}\r\n", args.size());
+  for (const std::string_view a : args) {
+    out += bulk(a);
+  }
+  return out;
+}
+
 std::string get_cmd(std::string_view key) {
-  return fmt::format("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", key.size(), key);
+  return cmd({"GET", key});
+}
+
+// The first "kN" whose slot lands in [lo, hi]. Beats hard-coding a key: the
+// split points in these tests are arbitrary and the hash is not.
+std::string key_in(std::uint16_t lo, std::uint16_t hi) {
+  for (int i = 0; i < 4096; ++i) {
+    std::string k = fmt::format("k{}", i);
+    const std::uint16_t s = cluster::key_slot(k);
+    if (s >= lo && s <= hi) {
+      return k;
+    }
+  }
+  FAIL("no key hashes into the requested slot range");
+  return {};
 }
 
 proxy::config cluster_config(std::uint16_t seed_port) {
@@ -321,4 +350,159 @@ TEST_CASE("standalone passes a redirect through instead of chasing it", "[cluste
   loop.run();
 
   CHECK(out == "-MOVED 0 127.0.0.1:1\r\n");
+}
+
+TEST_CASE("keys reach the node that owns their slot", "[cluster][routing]") {
+  io::event_loop loop;
+  fake_node n0{loop};
+  fake_node n1{loop};
+  n0.shards = shards_frame({{0, 8191, n0.port}, {8192, 16383, n1.port}});
+  n0.start();
+  n1.start();
+
+  proxy::server srv{loop, cluster_config(n0.port)};
+  srv.start();
+
+  const std::string low = key_in(0, 8191);
+  const std::string high = key_in(8192, 16383);
+  std::string out;
+  io::spawn(client_script(loop, srv,
+                          {{get_cmd(low), n0.tag.size()}, {get_cmd(high), n1.tag.size()}}, out));
+  loop.run();
+
+  CHECK(out == n0.tag + n1.tag);
+  CHECK(served(n0, low) == 1);
+  CHECK(served(n1, high) == 1);
+  CHECK(served(n1, low) == 0);
+  CHECK(served(n0, high) == 0);
+}
+
+TEST_CASE("a multi-key command must stay inside one slot", "[cluster][routing]") {
+  io::event_loop loop;
+  fake_node n0{loop};
+  fake_node n1{loop};
+  n0.shards = shards_frame({{0, 8191, n0.port}, {8192, 16383, n1.port}});
+  n0.start();
+  n1.start();
+
+  proxy::server srv{loop, cluster_config(n0.port)};
+  srv.start();
+
+  // A hash tag forces both keys into one slot; without it they scatter.
+  const std::uint16_t tagged = cluster::key_slot("{t}a");
+  REQUIRE(tagged == cluster::key_slot("{t}b"));
+  const fake_node& owner = tagged <= 8191 ? n0 : n1;
+  const std::string spread_a = key_in(0, 8191);
+  const std::string spread_b = key_in(8192, 16383);
+
+  std::string out;
+  io::spawn(client_script(loop, srv,
+                          {{cmd({"MGET", "{t}a", "{t}b"}), owner.tag.size()},
+                           {cmd({"MGET", spread_a, spread_b}), proxy::kErrCrossSlot.size()}},
+                          out));
+  loop.run();
+
+  CHECK(out == owner.tag + std::string{proxy::kErrCrossSlot});
+  // The cross-slot MGET is rejected from the argv alone: no node ever saw it.
+  CHECK(served(n0, spread_a) == 0);
+  CHECK(served(n1, spread_b) == 0);
+}
+
+TEST_CASE("a slow node does not reorder the client's replies", "[cluster][routing]") {
+  io::event_loop loop;
+  fake_node slow{loop};
+  fake_node fast{loop};
+  slow.shards = shards_frame({{0, 8191, slow.port}, {8192, 16383, fast.port}});
+  slow.delay = 60ms;
+  slow.start();
+  fast.start();
+
+  proxy::server srv{loop, cluster_config(slow.port)};
+  srv.start();
+
+  // Pipelined in one write, so both are in flight at once: the second reply
+  // lands ~60ms before the first and must wait in its slot (design m4 §1).
+  const std::string first = key_in(0, 8191);
+  const std::string second = key_in(8192, 16383);
+  std::string out;
+  io::spawn(client_script(
+      loop, srv, {{get_cmd(first) + get_cmd(second), slow.tag.size() + fast.tag.size()}}, out));
+  loop.run();
+
+  CHECK(out == slow.tag + fast.tag);  // request order, not arrival order
+}
+
+TEST_CASE("cluster mode refuses what it cannot route", "[cluster][routing]") {
+  io::event_loop loop;
+  fake_node n0{loop};
+  n0.shards = shards_frame({{0, 16383, n0.port}});
+  n0.start();
+
+  proxy::server srv{loop, cluster_config(n0.port)};
+  srv.start();
+
+  // CLUSTER is refused outright (the proxy always looks standalone); SCAN and
+  // unknown commands have no sane cluster route and are not guessed at.
+  const std::string cluster_err = "-ERR unsupported by proxy: CLUSTER\r\n";
+  const std::string scan_err = "-ERR proxy: unsupported in cluster mode: SCAN\r\n";
+  const std::string unknown_err = "-ERR proxy: unsupported in cluster mode: unknown command\r\n";
+  std::string out;
+  io::spawn(client_script(loop, srv,
+                          {{cmd({"CLUSTER", "INFO"}), cluster_err.size()},
+                           {cmd({"SCAN", "0"}), scan_err.size()},
+                           {cmd({"NOSUCHCOMMAND"}), unknown_err.size()},
+                           {cmd({"PING"}), 7},
+                           {cmd({"ECHO", "hi"}), 8}},
+                          out));
+  loop.run();
+
+  // PING/ECHO are answered by the proxy: no node round trip at all.
+  CHECK(out == cluster_err + scan_err + unknown_err + "+PONG\r\n$2\r\nhi\r\n");
+  CHECK(n0.seen.size() == 1);  // just the warmup GET
+}
+
+TEST_CASE("a refresh moves traffic off a node that left the topology", "[cluster][routing]") {
+  io::event_loop loop;
+  fake_node n0{loop};
+  fake_node n1{loop};
+  n0.shards = shards_frame({{0, 8191, n0.port}, {8192, 16383, n1.port}});
+  n0.shards_budget = 1000;  // this test wants the refresher to keep polling
+  n0.start();
+  n1.start();
+
+  proxy::config cfg = cluster_config(n0.port);
+  cfg.cluster_refresh = 20ms;
+  proxy::server srv{loop, cfg};
+  srv.start();
+
+  const std::string high = key_in(8192, 16383);
+  std::string out;
+  io::spawn([](io::event_loop& l, proxy::server& s, fake_node& a, const fake_node& b,
+               std::string key, std::string& sink) -> io::task<void> {
+    io::unique_fd fd = co_await io::connect_tcp(l, io::resolve_tcp("127.0.0.1", s.port()));
+    // Poll until the key is served by b, then hand its slots to a and poll
+    // until the refresher has moved the traffic over.
+    for (int phase = 0; phase < 2; ++phase) {
+      const std::string& want = phase == 0 ? b.tag : a.tag;
+      bool got = false;
+      for (int attempt = 0; attempt < 400 && !got; ++attempt) {
+        (void)co_await io::send_all(l, fd.get(), get_cmd(key));
+        std::string reply;
+        co_await collect(l, fd.get(), 1, reply);
+        if (reply.empty()) {
+          co_return;
+        }
+        got = reply == want;
+        if (!got) {
+          (void)co_await l.sleep_for(5ms);
+        }
+      }
+      sink += got ? "y" : "n";
+      a.shards = shards_frame({{0, 16383, a.port}});  // b hands its slots back
+    }
+    s.begin_shutdown();
+  }(loop, srv, n0, n1, high, out));
+  loop.run();
+
+  CHECK(out == "yy");
 }
