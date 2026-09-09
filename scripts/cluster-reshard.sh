@@ -82,7 +82,12 @@ for ((round = 1; round <= ROUNDS; round++)); do
     echo "round ${round} failed" >&2
     exit 1
   fi
-  echo "  moved ${SLOTS} slot(s)"
+  # redis-cli prints one dot per migrated key on its "Moving slot" lines
+  # (calibrated: a 1500-key slot printed exactly 1500 dots). Reporting it
+  # distinguishes a real migration from a reshard that just relabelled empty
+  # slots — the difference between exercising MOVED/ASK and proving nothing.
+  keys="$(grep '^Moving slot' <<<"${out}" | sed 's/.*: //' | tr -cd '.' | wc -c)"
+  echo "  moved ${SLOTS} slot(s), ${keys} keys"
 done
 
 wait_agreement
