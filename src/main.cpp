@@ -3,9 +3,11 @@
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 #include <CLI/CLI.hpp>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <quill/Backend.h>
 #include <quill/Frontend.h>
 #include <quill/LogMacros.h>
@@ -63,8 +65,21 @@ int main(int argc, char** argv) {
   bool cpu_affinity = false;
   std::size_t conns_per_backend = 1;
   std::uint32_t request_timeout_ms = 1000;
+  std::vector<std::string> cluster_seeds;
+  std::uint32_t cluster_refresh_ms = 5000;
+  std::size_t max_redirects = 5;
   app.add_option("-l,--listen", listen_ep, "Listen endpoint (host:port)")->capture_default_str();
-  app.add_option("-b,--backend", backend_ep, "Backend valkey endpoint (host:port)")
+  auto* backend_opt =
+      app.add_option("-b,--backend", backend_ep, "Backend valkey endpoint (host:port)")
+          ->capture_default_str();
+  app.add_option("--cluster-seeds", cluster_seeds,
+                 "Comma-separated cluster seed endpoints; enables cluster mode")
+      ->delimiter(',')
+      ->excludes(backend_opt);
+  app.add_option("--cluster-refresh-ms", cluster_refresh_ms, "Topology refresh interval")
+      ->capture_default_str();
+  app.add_option("--max-redirects", max_redirects, "MOVED/ASK redirects allowed per request")
+      ->check(CLI::Range(1, 64))
       ->capture_default_str();
   app.add_option("--io-backend", io_backend, "IO backend")
       ->check(CLI::IsMember({"auto", "io_uring", "epoll", "kqueue"}))
@@ -90,6 +105,14 @@ int main(int argc, char** argv) {
     vkp::proxy::worker_pool::options opt;
     std::tie(opt.cfg.listen_host, opt.cfg.listen_port) = parse_endpoint(listen_ep);
     std::tie(opt.cfg.backend_host, opt.cfg.backend_port) = parse_endpoint(backend_ep);
+    // Reject a malformed seed here rather than at the first bootstrap attempt,
+    // where it would look like an unreachable node.
+    for (const std::string& seed : cluster_seeds) {
+      (void)parse_endpoint(seed);
+    }
+    opt.cfg.cluster_seeds = cluster_seeds;
+    opt.cfg.cluster_refresh = std::chrono::milliseconds{cluster_refresh_ms};
+    opt.cfg.max_redirects = max_redirects;
     opt.cfg.conns_per_backend = conns_per_backend;
     opt.cfg.backend.request_timeout = std::chrono::milliseconds{request_timeout_ms};
     opt.workers = workers;
@@ -114,11 +137,15 @@ int main(int argc, char** argv) {
     (void)std::signal(SIGTERM, on_signal);
     (void)std::signal(SIGINT, on_signal);
 
+    const std::string upstream =
+        cluster_seeds.empty()
+            ? fmt::format("backend {}:{}", opt.cfg.backend_host, opt.cfg.backend_port)
+            : fmt::format("cluster seeds {}", fmt::join(cluster_seeds, ","));
     LOG_INFO(logger,
-             "valkey-proxy {} listening on {}:{} -> backend {}:{} "
+             "valkey-proxy {} listening on {}:{} -> {} "
              "({} worker(s), {} conn(s)/backend, io: {})",
-             vkp::kVersion, opt.cfg.listen_host, pool.port(), opt.cfg.backend_host,
-             opt.cfg.backend_port, pool.workers(), conns_per_backend, pool.io_backend_name());
+             vkp::kVersion, opt.cfg.listen_host, pool.port(), upstream, pool.workers(),
+             conns_per_backend, pool.io_backend_name());
 
     pool.run();
 
