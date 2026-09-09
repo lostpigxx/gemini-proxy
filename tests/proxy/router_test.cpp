@@ -164,7 +164,8 @@ TEST_CASE("parse_endpoint splits host and port", "[router]") {
 
 TEST_CASE("standalone is one node owning every slot", "[router]") {
   io::event_loop loop;
-  proxy::router r{loop, {.backend_host = "127.0.0.1", .backend_port = 6379}};
+  proxy::router_config cfg;  // defaults are standalone against 127.0.0.1:6379
+  proxy::router r{loop, cfg};
 
   CHECK_FALSE(r.cluster_mode());
   CHECK_FALSE(r.may_redirect());  // no MOVED possible: clients skip the retry copy
@@ -185,7 +186,9 @@ TEST_CASE("standalone is one node owning every slot", "[router]") {
 
 TEST_CASE("a node's connections are handed out round-robin", "[router]") {
   io::event_loop loop;
-  proxy::router r{loop, {.backend_host = "127.0.0.1", .backend_port = 6379, .conns_per_node = 2}};
+  proxy::router_config cfg;
+  cfg.conns_per_node = 2;
+  proxy::router r{loop, cfg};
 
   const auto first = r.route(argv({"GET", "k"}), proxy::find_command("GET"));
   const auto second = r.route(argv({"GET", "k"}), proxy::find_command("GET"));
