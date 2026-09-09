@@ -30,6 +30,7 @@ namespace vkp::proxy {
 inline constexpr std::string_view kErrNoTopology = "-ERR proxy: cluster topology unavailable\r\n";
 inline constexpr std::string_view kErrCrossSlot =
     "-CROSSSLOT Keys in request don't hash to the same slot\r\n";
+inline constexpr std::string_view kErrTooManyRedirects = "-ERR proxy: too many redirections\r\n";
 
 struct router_config {
   std::string backend_host = "127.0.0.1";

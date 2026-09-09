@@ -1,17 +1,20 @@
 #include "proxy/server.hpp"
 
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include <fmt/format.h>
 
+#include "cluster/slot.hpp"
 #include "core/buffer.hpp"
 #include "core/byte_queue.hpp"
 #include "core/version.hpp"
@@ -129,6 +132,69 @@ std::string cluster_local_reply(const resp::message_view& msg, const command_inf
   return r;
 }
 
+constexpr std::string_view kAsking = "*1\r\n$6\r\nASKING\r\n";
+
+// A parsed "-MOVED 3999 127.0.0.1:6381\r\n" / "-ASK 3999 127.0.0.1:6381\r\n".
+// `host` borrows from the frame, so it dies with the backend's read buffer —
+// callers must resolve it before their next suspension point.
+struct redirect {
+  bool valid = false;
+  bool moved = false;  // false = ASK: a migration-time hop, topology untouched
+  std::uint16_t slot = 0;
+  std::string_view host;
+  std::uint16_t port = 0;
+};
+
+bool parse_u16(std::string_view text, unsigned& out) noexcept {
+  const char* end = text.data() + text.size();
+  const auto r = std::from_chars(text.data(), end, out);
+  return r.ec == std::errc{} && r.ptr == end;
+}
+
+redirect parse_redirect(std::string_view frame) noexcept {
+  redirect r;
+  std::string_view rest;
+  if (frame.starts_with("-MOVED ")) {
+    r.moved = true;
+    rest = frame.substr(7);
+  } else if (frame.starts_with("-ASK ")) {
+    rest = frame.substr(5);
+  } else {
+    return r;
+  }
+  if (const std::size_t cr = rest.find('\r'); cr != std::string_view::npos) {
+    rest = rest.substr(0, cr);
+  }
+  const std::size_t space = rest.find(' ');
+  if (space == std::string_view::npos) {
+    return r;
+  }
+  unsigned slot = 0;
+  if (!parse_u16(rest.substr(0, space), slot) || slot >= cluster::kSlotCount) {
+    return r;
+  }
+  // A node with no known address answers "-MOVED 1 :6380". We cannot resolve
+  // that from here (we do not know which node replied), so `colon == 0` leaves
+  // the redirect invalid and the client sees the backend's own error.
+  const std::string_view addr = rest.substr(space + 1);
+  const std::size_t colon = addr.rfind(':');
+  if (colon == std::string_view::npos || colon == 0 || colon + 1 == addr.size()) {
+    return r;
+  }
+  unsigned port = 0;
+  if (!parse_u16(addr.substr(colon + 1), port) || port == 0 || port > 65535) {
+    return r;
+  }
+  r.host = addr.substr(0, colon);
+  if (r.host.size() >= 2 && r.host.front() == '[' && r.host.back() == ']') {
+    r.host = r.host.substr(1, r.host.size() - 2);
+  }
+  r.slot = static_cast<std::uint16_t>(slot);
+  r.port = static_cast<std::uint16_t>(port);
+  r.valid = true;
+  return r;
+}
+
 std::string route_error_reply(routing::status st, const command_info* info) {
   switch (st) {
     case routing::status::crossslot:
@@ -156,11 +222,14 @@ std::string route_error_reply(routing::status st, const command_info* info) {
 // lets cluster routing fan a client out across nodes.
 class client_conn final : public reply_sink {
  public:
-  client_conn(io::event_loop& loop, io::unique_fd fd, router& rtr, std::size_t outbuf_limit)
+  client_conn(io::event_loop& loop, io::unique_fd fd, router& rtr, std::size_t outbuf_limit,
+              std::size_t max_redirects)
       : loop_(loop),
         fd_(std::move(fd)),
         router_(rtr),
         outbuf_limit_(outbuf_limit),
+        max_redirects_(max_redirects),
+        may_redirect_(rtr.may_redirect()),
         out_ready_(loop),
         drained_(loop),
         writer_done_(loop) {}
@@ -173,8 +242,9 @@ class client_conn final : public reply_sink {
     co_await reader();
     if (!aborting_) {
       // Client stopped sending (EOF/QUIT/error): deliver what it is still
-      // owed before closing. Bounded by the request timeout — a dead
-      // backend fails the queue, which drains us too.
+      // owed before closing. Bounded by the request timeout (times the
+      // redirect cap under cluster routing) — a dead backend fails the
+      // queue, which drains us too.
       while (!slots_.empty() && !aborting_) {
         if (co_await drained_.wait() < 0) {
           break;
@@ -201,6 +271,28 @@ class client_conn final : public reply_sink {
     if (index >= slots_.size()) {
       return;  // already flushed or abandoned; nothing to fill
     }
+    // MOVED/ASK never reach the client: the retry rides the same slot, so the
+    // hop is invisible in the output order (design m4 §5).
+    if (may_redirect_ && frame.starts_with('-')) {
+      if (const redirect r = parse_redirect(frame); r.valid) {
+        retry(index, r, frame);
+        return;
+      }
+    }
+    fill(index, frame);
+  }
+
+ private:
+  struct reply_slot {
+    bool filled = false;
+    std::string reply;    // only populated when the reply arrived out of order
+    std::string request;  // retry copy; cluster mode only (router::may_redirect)
+    std::uint32_t redirects = 0;
+  };
+
+  // Puts `frame` in its place in the output order and flushes the contiguous
+  // filled prefix.
+  void fill(std::size_t index, std::string_view frame) {
     if (index != 0) {
       // Out of order: park it and wait for the earlier slots.
       slots_[index].filled = true;
@@ -225,11 +317,42 @@ class client_conn final : public reply_sink {
     out_ready_.notify_one();
   }
 
- private:
-  struct reply_slot {
-    bool filled = false;
-    std::string reply;  // only populated when the reply arrived out of order
-  };
+  // Re-sends the slot's request to the node the redirect named. Runs inside
+  // the old connection's driver, so it must not park: if the target has no
+  // capacity we overshoot its watermark rather than fail the request (see
+  // enqueue_forward), which is what keeps resharding under load error-free.
+  void retry(std::size_t index, const redirect& r, std::string_view frame) {
+    reply_slot& s = slots_[index];
+    if (s.request.empty()) {
+      fill(index, frame);  // nothing kept to re-send: pass the error through
+      return;
+    }
+    if (s.redirects >= max_redirects_) {
+      fill(index, kErrTooManyRedirects);
+      return;
+    }
+    ++s.redirects;
+    if (r.moved) {
+      // Repoint the slot now; the debounced refresh picks up the rest.
+      router_.apply_moved(r.slot, r.host, r.port);
+    }
+    // Resolves the endpoint (numeric, so no DNS round trip) and creates the
+    // pool entry if this node is new to us.
+    const routing dest = router_.node_at(r.host, r.port);
+    backend_conn* c = dest.get();
+    if (dest.st != routing::status::ok || !c->available()) {
+      fill(index, kErrBackendUnavailable);
+      return;
+    }
+    remember(*dest.slot);
+    if (!r.moved) {
+      // ASKING must immediately precede the command on the same connection.
+      // Single-threaded, so two consecutive pushes are adjacent by
+      // construction; its +OK is discarded by the null sink.
+      c->enqueue_internal(kAsking);
+    }
+    c->enqueue_forward(*this, head_token_ + index, s.request);
+  }
 
   // Takes the next token and reserves its place in the output order.
   // Invariant: next_token_ == head_token_ + slots_.size().
@@ -308,7 +431,11 @@ class client_conn final : public reply_sink {
           }
           if (c->has_capacity()) {
             remember(*r.slot);
-            c->enqueue_forward(*this, new_slot(), msg.raw);
+            const std::uint64_t token = new_slot();
+            if (may_redirect_) {
+              slots_.back().request.assign(msg.raw);  // MOVED/ASK may need it back
+            }
+            c->enqueue_forward(*this, token, msg.raw);
             break;
           }
           // Backpressure: wait for queue capacity; the client socket goes
@@ -376,6 +503,8 @@ class client_conn final : public reply_sink {
   io::unique_fd fd_;
   router& router_;
   std::size_t outbuf_limit_;
+  std::size_t max_redirects_;
+  bool may_redirect_;  // standalone skips the per-request retry copy
 
   std::vector<std::shared_ptr<backend_conn>> used_;
   byte_queue out_;
@@ -460,7 +589,7 @@ io::task<void> server::acceptor() {
 io::task<void> server::connection(io::unique_fd client) {
   ++active_;
   {
-    client_conn c{loop_, std::move(client), router_, cfg_.client_outbuf_limit};
+    client_conn c{loop_, std::move(client), router_, cfg_.client_outbuf_limit, cfg_.max_redirects};
     try {
       co_await c.run();
     } catch (const std::exception&) {

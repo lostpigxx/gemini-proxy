@@ -170,6 +170,21 @@ ZUNION/ZINTER/ZDIFF/SINTERCARD/LMPOP/ZMPOP（numkeys@1）、CLUSTER（reject，�
 - 重定向上限 `--max-redirects`（默认 5，与主流客户端一致）。超限回
   `-ERR proxy: too many redirections`。
 
+### 5.1 实施时定下的两个细节
+
+**重试允许突破 `max_inflight`。** 重定向在 `deliver()` 里发生，而 `deliver()` 跑在
+*旧*连接的 driver 回调中，不能挂起——所以目标连接没配额时无法像读路径那样 park 等待。
+两个选项：回一个软错误，或者超发。选**超发**：回软错误就等于「resharding 期间客户端
+会看到错误」，而这正是 M4 的验收标准要排除的。超发量的上界是当下在飞的请求数（它本身
+受源连接的 `max_inflight` 约束），所以是有界的。因此 `enqueue_forward()` 的前置条件从
+`available() && has_capacity()` 放宽到只要 `available()`；读路径仍然自己先查
+`has_capacity()` 并 park，热路径行为不变。
+
+**空 host 的 MOVED 原样透传。** 节点没有已知地址时 valkey 会回 `-MOVED 1 :6380`，
+意思是「还是刚才那个 host」。但 `client_conn` 并不知道是哪个节点回的（`deliver()` 只拿到
+token 和帧内容，这是 §1 刻意保持的解耦），无从补全。于是把这种帧判为「不是有效重定向」，
+直接把后端的原始错误交给客户端——比猜一个地址诚实。
+
 ## 6. proxy 对外形象：始终是 standalone
 
 与现有 HELLO 应答（`mode=standalone`，M3 §5）保持一致：**`CLUSTER` 命令一律拒绝**。

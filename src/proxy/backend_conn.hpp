@@ -90,9 +90,18 @@ class backend_conn {
   [[nodiscard]] io::wait_queue& capacity_event() noexcept { return capacity_; }
 
   // Copies `frame` into the outbound queue and appends a FIFO pairing entry.
-  // The response comes back as sink.deliver(token, ...). Pre: available() &&
-  // has_capacity(). `sink` must stay valid until delivery or detach().
+  // The response comes back as sink.deliver(token, ...). `sink` must stay
+  // valid until delivery or detach().
+  //
+  // Pre: available(). The client hot path also checks has_capacity() first and
+  // parks when it is gone; the redirect path (design m4 §5) deliberately skips
+  // that check, because deliver() runs inside this connection's driver and
+  // cannot park. The overshoot is bounded by the requests already in flight.
   void enqueue_forward(reply_sink& sink, std::uint64_t token, std::string_view frame);
+
+  // Same, for a request whose reply the proxy discards (ASKING before a
+  // redirected command). Pairing still consumes one backend frame.
+  void enqueue_internal(std::string_view frame);
 
   // Tombstones every queued entry pointing at `sink` (client went away;
   // entries must stay for pairing, their responses are discarded).
@@ -126,6 +135,7 @@ class backend_conn {
   io::task<void> read_responses();  // one connected session; returns on error/kill
   io::task<bool> backoff_wait();    // false: drain/stop, exit the driver loop
   void teardown_session() noexcept;
+  void push(reply_sink* sink, std::uint64_t token, std::string_view frame);
   void deliver_head(std::string_view frame);
   void fail_all() noexcept;
   void poke_watchdog() noexcept;

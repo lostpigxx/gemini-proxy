@@ -59,17 +59,25 @@ void backend_conn::start() {
   io::spawn(watchdog());
 }
 
-void backend_conn::enqueue_forward(reply_sink& sink, std::uint64_t token, std::string_view frame) {
-  assert(available() && has_capacity());
+void backend_conn::push(reply_sink* sink, std::uint64_t token, std::string_view frame) {
+  assert(available());
   const bool was_empty = inflight_.empty();
   const auto now = std::chrono::steady_clock::now();
   out_.append(frame);
-  inflight_.push_back({.sink = &sink, .token = token, .deadline = now + cfg_.request_timeout});
+  inflight_.push_back({.sink = sink, .token = token, .deadline = now + cfg_.request_timeout});
   last_activity_ = now;
   out_ready_.notify_one();
   if (was_empty) {
     poke_watchdog();  // switch from idle/health timing to the head deadline
   }
+}
+
+void backend_conn::enqueue_forward(reply_sink& sink, std::uint64_t token, std::string_view frame) {
+  push(&sink, token, frame);
+}
+
+void backend_conn::enqueue_internal(std::string_view frame) {
+  push(nullptr, 0, frame);
 }
 
 void backend_conn::detach(reply_sink& sink) noexcept {

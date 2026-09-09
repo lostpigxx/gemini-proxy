@@ -10,6 +10,7 @@ add_executable(vkp_tests
   io/task_test.cpp
   io/wait_queue_test.cpp
   proxy/command_table_test.cpp
+  proxy/cluster_routing_test.cpp
   proxy/proxy_test.cpp
   proxy/router_test.cpp
   proxy/worker_pool_test.cpp
