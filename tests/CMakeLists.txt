@@ -11,6 +11,7 @@ add_executable(vkp_tests
   io/wait_queue_test.cpp
   proxy/command_table_test.cpp
   proxy/proxy_test.cpp
+  proxy/router_test.cpp
   proxy/worker_pool_test.cpp
   resp/parser_test.cpp
   resp/serializer_test.cpp

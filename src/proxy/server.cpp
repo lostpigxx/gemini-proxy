@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -15,6 +17,7 @@
 #include "core/version.hpp"
 #include "io/wait_queue.hpp"
 #include "proxy/command_table.hpp"
+#include "proxy/router.hpp"
 #include "resp/parser.hpp"
 #include "resp/serializer.hpp"
 
@@ -101,6 +104,45 @@ std::string handle_local(const resp::message_view& msg, const command_info& info
   return hello_reply(proto);
 }
 
+// PING/ECHO under cluster routing. Forwarding them would mean picking an
+// arbitrary node for a command whose whole point is the round trip, so the
+// proxy answers instead (design m4 §3, §7 spells out the consequence for
+// `redis-benchmark -t ping`).
+std::string cluster_local_reply(const resp::message_view& msg, const command_info& info) {
+  if (info.name == "ECHO") {
+    if (msg.args.size() != 2) {
+      return "-ERR wrong number of arguments for 'echo' command\r\n";
+    }
+    std::string r;
+    resp::append_bulk_string(r, msg.args[1]);
+    return r;
+  }
+  // PING [message]
+  if (msg.args.size() == 1) {
+    return "+PONG\r\n";
+  }
+  if (msg.args.size() != 2) {
+    return "-ERR wrong number of arguments for 'ping' command\r\n";
+  }
+  std::string r;
+  resp::append_bulk_string(r, msg.args[1]);
+  return r;
+}
+
+std::string route_error_reply(routing::status st, const command_info* info) {
+  switch (st) {
+    case routing::status::crossslot:
+      return std::string{kErrCrossSlot};
+    case routing::status::unsupported:
+      return fmt::format("-ERR proxy: unsupported in cluster mode: {}\r\n",
+                         info != nullptr ? info->name : std::string_view{"unknown command"});
+    case routing::status::unavailable:
+    case routing::status::ok:
+      break;
+  }
+  return std::string{kErrNoTopology};
+}
+
 // One client connection: a reader (frames → command table → backend queue)
 // and a writer (flushes the outbound byte queue). Replies arrive via
 // deliver() from a backend connection's driver.
@@ -114,10 +156,10 @@ std::string handle_local(const resp::message_view& msg, const command_info& info
 // lets cluster routing fan a client out across nodes.
 class client_conn final : public reply_sink {
  public:
-  client_conn(io::event_loop& loop, io::unique_fd fd, backend_conn& conn, std::size_t outbuf_limit)
+  client_conn(io::event_loop& loop, io::unique_fd fd, router& rtr, std::size_t outbuf_limit)
       : loop_(loop),
         fd_(std::move(fd)),
-        conn_(conn),
+        router_(rtr),
         outbuf_limit_(outbuf_limit),
         out_ready_(loop),
         drained_(loop),
@@ -144,7 +186,11 @@ class client_conn final : public reply_sink {
     while (writer_live_) {
       (void)co_await writer_done_.wait();
     }
-    conn_.detach(*this);
+    // Under cluster routing one client may have queued onto several nodes,
+    // so every connection it touched needs the tombstone.
+    for (const auto& c : used_) {
+      c->detach(*this);
+    }
   }
 
   void deliver(std::uint64_t token, std::string_view frame) override {
@@ -201,6 +247,19 @@ class client_conn final : public reply_sink {
   // lands in the right place among pipelined requests.
   void reply_now(std::string_view reply) { deliver(new_slot(), reply); }
 
+  // Keeps a connection alive for as long as this client might still be
+  // delivered on, and records who needs a tombstone at teardown. Typically
+  // one entry (standalone) and at most a handful under cluster routing, so a
+  // linear scan beats a set.
+  void remember(const std::shared_ptr<backend_conn>& c) {
+    for (const auto& seen : used_) {
+      if (seen.get() == c.get()) {
+        return;
+      }
+    }
+    used_.push_back(c);
+  }
+
   io::task<void> reader() {
     read_buffer in;
     resp::parser parser;
@@ -229,21 +288,39 @@ class client_conn final : public reply_sink {
         reply_now(fmt::format("-ERR unsupported by proxy: {}\r\n", info->name));
       } else if (policy == cmd_policy::local) {
         reply_now(handle_local(msg, *info, close_after));
+      } else if (router_.cluster_mode() && info != nullptr &&
+                 info->cluster == cluster_policy::local) {
+        reply_now(cluster_local_reply(msg, *info));
       } else {
-        // Backpressure: wait for queue capacity; the client socket goes
-        // unread meanwhile, so TCP pushes back upstream (design §2.5).
+        // Inline rather than a helper coroutine: this is the hot path and a
+        // nested frame would be a heap allocation per request.
+        bool stop = false;
         for (;;) {
-          if (!conn_.available()) {
+          const routing r = router_.route(msg.args, info);
+          if (r.st != routing::status::ok) {
+            reply_now(route_error_reply(r.st, info));
+            break;
+          }
+          backend_conn* c = r.get();
+          if (!c->available()) {
             reply_now(kErrBackendUnavailable);
             break;
           }
-          if (conn_.has_capacity()) {
-            conn_.enqueue_forward(*this, new_slot(), msg.raw);
+          if (c->has_capacity()) {
+            remember(*r.slot);
+            c->enqueue_forward(*this, new_slot(), msg.raw);
             break;
           }
-          if (co_await conn_.capacity_event().wait() < 0 || aborting_) {
-            co_return;
+          // Backpressure: wait for queue capacity; the client socket goes
+          // unread meanwhile, so TCP pushes back upstream (design §2.5).
+          // Re-route after waking: the topology may have moved on.
+          if (co_await c->capacity_event().wait() < 0 || aborting_) {
+            stop = true;
+            break;
           }
+        }
+        if (stop) {
+          co_return;
         }
       }
       in.consume(fr.len);  // enqueue_forward copied the bytes
@@ -297,9 +374,10 @@ class client_conn final : public reply_sink {
 
   io::event_loop& loop_;
   io::unique_fd fd_;
-  backend_conn& conn_;
+  router& router_;
   std::size_t outbuf_limit_;
 
+  std::vector<std::shared_ptr<backend_conn>> used_;
   byte_queue out_;
   std::deque<reply_slot> slots_;
   std::uint64_t next_token_ = 0;
@@ -318,23 +396,30 @@ class client_conn final : public reply_sink {
 
 }  // namespace
 
+namespace {
+
+router_config make_router_config(const config& cfg) {
+  return {
+      .backend_host = cfg.backend_host,
+      .backend_port = cfg.backend_port,
+      .cluster_seeds = cfg.cluster_seeds,
+      .refresh_interval = cfg.cluster_refresh,
+      .conns_per_node = cfg.conns_per_backend > 0 ? cfg.conns_per_backend : 1,
+      .backend = cfg.backend,
+  };
+}
+
+}  // namespace
+
 server::server(io::event_loop& loop, config cfg)
     : loop_(loop),
       cfg_(std::move(cfg)),
-      backend_addr_(io::resolve_tcp(cfg_.backend_host, cfg_.backend_port)),
+      router_(loop, make_router_config(cfg_)),
       listener_(io::listen_tcp(cfg_.listen_host, cfg_.listen_port, cfg_.backlog, cfg_.reuseport)),
-      port_(io::local_port(listener_.get())) {
-  const std::size_t n = cfg_.conns_per_backend > 0 ? cfg_.conns_per_backend : 1;
-  conns_.reserve(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    conns_.push_back(std::make_unique<backend_conn>(loop_, backend_addr_, cfg_.backend));
-  }
-}
+      port_(io::local_port(listener_.get())) {}
 
 void server::start() {
-  for (const auto& c : conns_) {
-    c->start();  // pool warmup: connecting begins now
-  }
+  router_.start();  // pool warmup: connecting begins now
   io::spawn(acceptor());
 }
 
@@ -351,12 +436,6 @@ void server::begin_shutdown() {
 io::task<void> server::watchdog() {
   (void)co_await loop_.sleep_for(cfg_.shutdown_grace);
   loop_.stop();  // idempotent; a clean drain already stopped the loop
-}
-
-backend_conn& server::pick_conn() noexcept {
-  backend_conn& c = *conns_[next_conn_];
-  next_conn_ = (next_conn_ + 1) % conns_.size();
-  return c;
 }
 
 io::task<void> server::acceptor() {
@@ -381,7 +460,7 @@ io::task<void> server::acceptor() {
 io::task<void> server::connection(io::unique_fd client) {
   ++active_;
   {
-    client_conn c{loop_, std::move(client), pick_conn(), cfg_.client_outbuf_limit};
+    client_conn c{loop_, std::move(client), router_, cfg_.client_outbuf_limit};
     try {
       co_await c.run();
     } catch (const std::exception&) {
@@ -401,16 +480,8 @@ void server::maybe_drain_backends() {
 }
 
 io::task<void> server::drain_backends() {
-  for (const auto& c : conns_) {
-    c->begin_drain();
-  }
-  for (const auto& c : conns_) {
-    while (!c->finished()) {
-      if (co_await c->finished_event().wait() < 0) {
-        co_return;  // hard stop already underway
-      }
-    }
-  }
+  router_.begin_drain();
+  co_await router_.await_drained();
   loop_.stop();
 }
 

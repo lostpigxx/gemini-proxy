@@ -1,12 +1,13 @@
-// M3 proxy server: one instance per worker. Clients bind to one pooled
-// backend connection at accept time; requests pipeline onto it with FIFO
-// pairing. Design: docs/design/m3-workers-pool-pipelining.md.
+// Proxy server: one instance per worker. Requests are routed per command by
+// the worker's router (standalone = one node owning every slot) and
+// pipelined onto pooled backend connections; the client itself puts the
+// replies back in order. Design: docs/design/m3-workers-pool-pipelining.md,
+// docs/design/m4-cluster-routing.md.
 #pragma once
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@
 #include "io/socket.hpp"
 #include "io/task.hpp"
 #include "proxy/backend_conn.hpp"
+#include "proxy/router.hpp"
 
 namespace vkp::proxy {
 
@@ -25,6 +27,12 @@ struct config {
   std::chrono::milliseconds shutdown_grace{5000};
   int backlog = 1024;
   bool reuseport = false;  // multi-worker: every worker binds its own listener
+
+  // Non-empty ("host:port" entries) switches to cluster mode; --backend is
+  // then unused.
+  std::vector<std::string> cluster_seeds;
+  std::chrono::milliseconds cluster_refresh{5000};
+  std::size_t max_redirects = 5;
 
   std::size_t conns_per_backend = 1;
   std::size_t client_outbuf_limit = 8U << 20;  // slow-client disconnect watermark
@@ -58,17 +66,14 @@ class server {
   io::task<void> watchdog();
   io::task<void> drain_backends();
   void maybe_drain_backends();
-  [[nodiscard]] backend_conn& pick_conn() noexcept;
 
   io::event_loop& loop_;
   config cfg_;
-  io::resolved_addr backend_addr_;
-  std::vector<std::unique_ptr<backend_conn>> conns_;
+  router router_;
   io::unique_fd listener_;
   std::uint16_t port_ = 0;
   io::cancel_slot accept_cancel_;
   std::size_t active_ = 0;
-  std::size_t next_conn_ = 0;
   bool draining_ = false;
   bool backend_drain_started_ = false;
 };

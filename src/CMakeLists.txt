@@ -9,6 +9,7 @@ add_library(vkp_lib STATIC
   io/wait_queue.cpp
   proxy/backend_conn.cpp
   proxy/command_table.cpp
+  proxy/router.cpp
   proxy/server.cpp
   proxy/worker_pool.cpp
   resp/parser.cpp
