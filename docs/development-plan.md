@@ -19,7 +19,7 @@
 | M1 | RESP 协议解析器 | 经 fuzz 验证的零拷贝 RESP2/3 解析与序列化库 | ✅ 完成（2026-08-24） |
 | M2 | 事件循环 + 最小可用 proxy | `valkey-cli` 可通过 proxy 访问单个后端 | ✅ 完成（2026-08-31） |
 | M3 | 多线程 + 连接池 + pipelining | 可承受多连接压测的生产形态骨架 | ✅ 完成（2026-09-07） |
-| M4 | cluster 路由 | 对接 valkey cluster，处理 MOVED/ASK | |
+| M4 | cluster 路由 | 对接 valkey cluster，处理 MOVED/ASK | ✅ 完成（2026-09-10） |
 | M5 | 可观测性与配置 | metrics / 日志 / 配置 / 优雅关闭 | |
 | M6 | 性能打磨 | 基线固化与针对性优化 | |
 
@@ -334,7 +334,9 @@
 
 ---
 
-## M4 — cluster 路由
+## M4 — cluster 路由 ✅
+
+**状态**：已完成（2026-09-10）。设计文档：[docs/design/m4-cluster-routing.md](design/m4-cluster-routing.md)。
 
 **目标**：对接 valkey cluster，proxy 屏蔽拓扑细节。
 
@@ -347,7 +349,123 @@
 5. **节点生命周期**：新节点出现时按需建池；节点从拓扑消失时 drain 并关闭其连接池。
 6. **集成测试环境**：`scripts/cluster-up.sh` 用 docker compose 拉起 3 主 3 从本地集群；集成测试脚本覆盖正常读写 + 手动 resharding 场景。
 
-**验收标准**：压测运行中执行 slot 迁移（resharding），客户端无错误（或仅有可解释的瞬时重试延迟）；MOVED/ASK 路径有集成测试覆盖。
+**验收标准**：压测运行中执行 slot 迁移（resharding），客户端无错误（或仅有可解释的瞬时重试延迟）；MOVED/ASK 路径有集成测试覆盖。**两项均达成**，实测见下。
+
+**实施记录（与计划的偏差）**：
+
+- **最大的一处改动计划里没有：客户端有序回复槽位**。M3 的保序依赖「一个客户端固定
+  绑定一条后端连接、按该连接的 FIFO 天然有序」，而 cluster 下相邻两条请求会落到不同
+  节点，两个节点的响应之间没有任何顺序关系。所以 M4 的第一步不是 slot 计算，而是**把
+  定序权从后端连接搬到客户端**：每条请求分配单调递增 token + `deque` 槽位，只刷出
+  连续已填充的前缀。其余全部建立在这之上（设计文档 §1）。
+  - 连带删除了 M3 的 `entry.local` / `local_reply` / `drain_local_heads` 整套机制：
+    客户端自己有槽位定序，本地回复直接填自己的槽即可。`backend_conn` 退化成纯传输层。
+  - 落地后复跑 M3 基线 A 确认无回归（`1d88b53`，门槛数据记在设计文档附录）：队头在
+    单后端下恒被立即填充，走的还是「直接 append、不落中间 string」那条路径。
+- **standalone 建模成「单节点拥有全部 16384 slot 且从不刷新」的退化 cluster**，只有
+  一条路由代码路径，不写两套。`may_redirect()` 在 standalone 为 false，据此跳过「保留
+  请求字节以备重试」的那次拷贝，M3 的性能特征不受影响。
+- **拓扑每 worker 各自持有、各自刷新，零共享（明确不引入 `atomic<shared_ptr>` 换指针）**：
+  计划原文的「不可变 + 原子替换」会打破贯穿 M0~M3 的「worker 之间零共享可变状态」不变量，
+  为一个每几秒一次的控制面操作破例不划算，热路径还要每请求 load 一次共享指针。代价是
+  控制面流量 ×worker 数，可接受——刷新复用已有数据连接（把 `CLUSTER SHARDS` 当普通请求
+  pipeline 进去），不额外建控制连接，因此自动继承了 M3 的超时/重连/背压体系。
+- **集成测试环境改为单容器内 6 个 server 进程，不用 docker compose（计划偏差）**：
+  本机直连 docker.io 极慢，compose 要额外拉/编排 6 个容器并处理 cluster announce-ip；
+  proxy、压测、resharding 本来就都在同一个验证容器内跑。见 `scripts/cluster-up.sh`
+  与设计文档 §8。
+- **无 key 命令分三层，不是计划写的「本地应答或随机节点」**：PING/ECHO 本地应答；
+  INFO/CONFIG/COMMAND/TIME 轮询任选 master；**SCAN/KEYS/DBSIZE/RANDOMKEY/FLUSHALL/
+  FLUSHDB 与查表未命中的未知命令在 cluster 模式明确拒绝**。宁可报错也不猜——猜错会把
+  请求发到错误节点，返回语义上错误但看起来正常的结果，这是最难排查的一类故障。
+  key 位置需要解析变参才能确定的 SORT/SORT_RO、GEORADIUS 系列、XREAD/XREADGROUP 同样
+  拒绝，进 backlog。
+- **`CLUSTER` 命令一律拒绝，proxy 对外始终是 standalone**（与 M3 的 HELLO
+  `mode=standalone` 一致）。透传真实拓扑会让 cluster-aware 客户端直连后端、完全绕过
+  proxy；伪造 CLUSTER SLOTS 指向 proxy 自己有真实价值但超出 M4 范围，进 backlog。
+  拓扑观测留给 M5 的 `/topology`。
+- **只支持 `CLUSTER SHARDS`，不做 `CLUSTER SLOTS` 回退**：验证环境的 redis 7.0.15
+  支持它，少一条代码路径。只取 `role=master && health=online`，读副本进 backlog。
+- **重定向重试允许突破 `max_inflight`（设计文档 §5.1）**：重定向发生在 `deliver()` 里，
+  而它跑在*旧*连接的 driver 回调中不能挂起，目标连接没配额时无法像读路径那样 park。
+  回软错误就等于「resharding 期间客户端会看到错误」，而这正是本里程碑验收标准要排除的，
+  所以选超发；超发量上界是当下在飞的请求数，有界。
+- **空 host 的 MOVED（`-MOVED 1 :6380`）原样透传**：`deliver()` 只拿到 token 和帧内容，
+  不知道是哪个节点回的（§1 刻意保持的解耦），无从补全，判为「不是有效重定向」交给客户端
+  比猜一个地址诚实。
+- **cluster 模式下 PING 不再打到后端**（本地应答的后果，设计文档 §7）：
+  `redis-benchmark -t ping` 打 cluster 模式的 proxy 只测到 proxy 自身。standalone 保持
+  M3 行为，所以 M3 的基线仍然可比。记在这里以免日后误读基线数字。
+- **验收工具是自己写的 `scripts/cluster-loadcheck.py`，不是 redis-benchmark**：
+  redis-benchmark 7.0.15 根本没有任何错误相关选项，它直接丢弃错误回复——全程回 `-MOVED`
+  的一轮照样打印漂亮的 rps，测不了「客户端零错误」这条验收标准。自带的校验客户端两阶段
+  交替（先 pipeline SET 收全回复，再 pipeline GET 校验取回原值），任何
+  `-ERR/-MOVED/-ASK/-CROSSSLOT` 抵达客户端都算失败。反向验证过它有效：直连裸节点跑，
+  如实报出 98 万条 MOVED。
+  - 第二阶段等第一阶段回复收全才发，是有意的：proxy 保证的是每客户端的**回复**顺序，
+    不是跨节点的执行顺序，同 key 的 GET 完全可能在 SET 还在重定向路上时越过它。
+- 测试规模：100 用例 / 8056 断言（M3 为 61 / 2664）。新增 `cluster/slot`、
+  `cluster/topology`、`proxy/router` 单测与 `proxy/cluster_routing_test`（可编排的假
+  cluster 节点，能返回 CLUSTER SHARDS 与 MOVED/ASK），后者覆盖按 slot 选中正确节点、
+  CROSSSLOT、MOVED 重试且拓扑已更新、ASK 发 ASKING+原命令且拓扑不变、重定向死循环封顶、
+  standalone 原样透传重定向、**慢节点先回时客户端出向顺序仍与请求顺序一致**、
+  刷新协程感知节点离开拓扑、cluster 模式拒绝集。
+
+**验收实测**（Linux 容器 aarch64 / OrbStack 内核 7.0 / 18 vCPU，clang-18；后端为同机
+`scripts/cluster-up.sh` 起的 3 主 3 从 redis 7.0.15，127.0.0.1:7000-7005）：
+
+- 构建矩阵全绿：clang-18 Debug、GCC-14 Debug、ASan+UBSan（`detect_leaks=1`）、TSan、
+  clang-18 Release，各 100/100（8056 断言）；io_uring 与 epoll 两条路径都跑到
+  （IO 层测试按 `available_backends()` 参数化）。
+- fuzz 短跑 60s / 268 万次执行，无 crash/leak/oom/timeout；顺带把语料 `-merge=1`
+  精简 896 → 470，覆盖率不变（495 edges / 2934 features）。
+- **真集群功能验收**（`redis-cli -p 6380`，**普通模式不加 `-c`**）：7 个分散在不同 slot
+  的 key SET/GET 全部正确；hash tag 同 slot 的 MSET/MGET 正常；跨 slot MGET 回
+  `CROSSSLOT Keys in request don't hash to the same slot` 且没有任何节点收到该命令；
+  DEL/EXISTS 正常；`CLUSTER INFO` → `ERR unsupported by proxy: CLUSTER`；
+  SCAN/KEYS/DBSIZE/RANDOMKEY/未知命令 → `ERR proxy: unsupported in cluster mode: ...`；
+  PING/ECHO 本地应答（后端零往返）；INFO 正常返回。
+- **ASK 路径手工验收**：对 slot 865 手工做 `CLUSTER SETSLOT ... IMPORTING/MIGRATING`，
+  源节点上存在的 key 照常由源节点服务，不存在的 key 源节点回 ASK——经 proxy 后
+  GET/SET 全部透明成功（客户端看不到 ASK）；期间反复读源节点上仍存在的 key 依然由源节点
+  服务，**证明 ASK 没有污染拓扑**。迁移完成 `SETSLOT ... NODE` 后经 proxy 读写继续正确，
+  MOVED 路径同样透明。
+- **resharding 零错误（验收项）**：`cluster-loadcheck.py -c 50 -P 16` 持续 90s，
+  期间（t=5s~26s，完整落在压测窗口内）用 `cluster-reshard.sh 300 --rounds 4` 双向搬迁
+  1200 个 slot / 约 118 万个 key。结果 **4863 万次操作，errors=0，mismatches=0**，
+  540,398 ops/s。
+- **TSan 下重跑无数据竞争报告（验收项）**：4 worker，`-c 30 -P 16` 持续 60s +
+  400 slot / 约 59 万 key 的双向 resharding，1984 万次操作，
+  **errors=0、mismatches=0、零 ThreadSanitizer 报告**。
+
+**性能基线（cluster 模式）**。命令行与 M3 基线 A 相同
+（`redis-benchmark -c 50 -d 32 --threads 4 -r 1000000`，`-P 1` 取 n=100 万、
+`-P 16` 取 n=500 万），proxy 4 worker、每节点 1 条连接，后端为 3 主。延迟单位毫秒：
+
+| 配置 | 命令 | P | rps | p50 | p95 | p99 |
+|---|---|---|---|---|---|---|
+| cluster io_uring w4 | SET | 1 | 249,875 | 0.167 | 0.319 | 0.415 |
+| cluster io_uring w4 | GET | 1 | 266,525 | 0.151 | 0.287 | 0.367 |
+| cluster io_uring w4 | SET | 16 | 1,427,348 | 0.367 | 0.775 | 1.023 |
+| cluster io_uring w4 | GET | 16 | 1,665,556 | 0.311 | 0.639 | 0.831 |
+| cluster epoll w4 | SET | 16 | 1,175,641 | 0.447 | 0.919 | 1.191 |
+| cluster epoll w4 | GET | 16 | 1,427,348 | 0.383 | 0.767 | 0.975 |
+
+  解读：
+
+  - **cluster 模式比 M3 的 standalone 模式慢，尽管后端从 1 个 redis 进程变成了 3 个**
+    （`-P 16`：SET 1.43M vs 2.50M、GET 1.67M vs 2.85M，约 57~58%）。后端容量翻了三倍
+    吞吐反而下降，说明瓶颈明确在 proxy 侧，不在后端。主因是**写合并被打散**：M3 下同一轮
+    事件循环里所有请求都进同一条后端连接的 `byte_queue`，合并成一次大 send；cluster 下
+    随机 key 均匀散到 3 个节点，每条连接只攒到约 1/3 的量，同样的请求数要发 3 倍次数的
+    syscall。每请求多出的 slot 计算与槽位查表是次要项（standalone 复跑基线 A 无回归已经
+    证明槽位机制本身不贵）。
+  - 这条正是 M6 的头号优化目标：**恢复散开后的批处理效率**（例如按目标节点聚合同一轮的
+    请求后再统一提交、或每节点多条连接配合更激进的合并窗口）。
+  - epoll 比 io_uring 慢 14~18%（`-P 16`），与 M3 观察到的 12~22% 一致。
+  - 上表不含直连对照组：M3 记录过直连 `-P 16` 在这台机器上会在 2.0M 与 3.33M 之间双峰
+    跳变（单线程 redis-server 的核放置随机），横向比值不可靠。cluster 与 standalone 的
+    纵向对比在同一轮内完成，可比。
 
 ---
 
@@ -376,6 +494,11 @@
 1. **基准环境固化**：`scripts/bench.sh` 一键跑 valkey-benchmark/memtier 标准场景集（不同 value 大小 × pipeline 深度 × 连接数），输出对比直连的报告；每次优化前后跑同一套。
 2. **profile**：perf + 火焰图定位热点；重点检查：syscall 次数/请求、内存分配次数/请求、跨核 cache miss。
 3. **候选优化项**（按预期收益排序，逐项用数据验证取舍）：
+   - **恢复 cluster 模式下被打散的写合并（M4 移交，头号目标）**：M4 实测 cluster 模式
+     `-P 16` 只有 standalone 的 57~58%，而后端进程数还多了两倍——随机 key 均匀散到 3 个
+     节点后，每条后端连接只攒到约 1/3 的量，同样的请求数要发 3 倍次数的 syscall。
+     候选做法：按目标节点聚合同一轮事件循环内的请求后统一提交、每节点多条连接配合更
+     激进的合并窗口。
    - provided buffer ring + multishot recv/accept（M2 移交：multishot recv 依赖
      buffer ring，两者必须一起做）
    - 批量 submit（一次 `io_uring_submit` 提交多个 SQE）与回写合并（多条响应一次 send）
@@ -389,7 +512,10 @@
      直连增加 **≤ 15%**，吞吐 **≥ 直连 92%**。
    - `-c 50 -P 1`：M3 实测每请求固定增量 ~32 µs（p50 0.103 → 0.135 ms），吞吐为直连
      77~85%。目标固定增量 **≤ 20 µs**，吞吐 **≥ 直连 90%**。
-   - epoll 路径：M3 实测比 io_uring 慢 12~22%，不设优化目标，只要求不退化。
+   - epoll 路径：M3 实测比 io_uring 慢 12~22%（M4 cluster 模式下 14~18%），不设优化
+     目标，只要求不退化。
+   - cluster 模式另立一档：M4 实测 `-P 16` 为 standalone 的 57~58%，目标
+     **≥ 80%**（同一轮内纵向对比，不与直连比）。
 
 **验收标准**：报告展示每项优化的前后对比；最终数字写入 README。
 
@@ -405,6 +531,12 @@
 - 读写分离（读走副本）、就近路由
 - 配置热重载、慢查询日志
 - inline command 支持
+- cluster 模式下明确拒绝的命令（M4 定的，宁可报错也不猜）：
+  - 单节点语义、集群下会静默给出错答案的 SCAN/KEYS/DBSIZE/RANDOMKEY/FLUSHALL/FLUSHDB
+  - key 位置需解析变参才能确定的 SORT/SORT_RO（`STORE`）、GEORADIUS 系列（`STORE`）、
+    XREAD/XREADGROUP（`STREAMS`）
+- 伪造 `CLUSTER SLOTS`（全部 slot 指向 proxy 自己），让 cluster-aware 客户端库也能直接用
+- `CLUSTER SLOTS` 回退（M4 只实现了 `CLUSTER SHARDS`）
 
 ## 工作约定
 
