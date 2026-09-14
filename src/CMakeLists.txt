@@ -3,6 +3,7 @@ add_library(vkp_lib STATIC
   cluster/topology.cpp
   core/buffer.cpp
   core/log.cpp
+  core/metrics.cpp
   io/backend.cpp
   io/event_loop.cpp
   io/frame_pool.cpp

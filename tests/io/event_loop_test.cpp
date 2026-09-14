@@ -92,6 +92,22 @@ TEST_CASE("event_loop per-backend behavior", "[io][event_loop]") {
         CHECK(std::chrono::steady_clock::now() - t0 >= 50ms);
       }
 
+      SECTION("now() is refreshed after a blocking poll, not before it") {
+        // The whole zero-syscall latency scheme rests on this: run() caches
+        // the clock, and poll() may block for a long time before anything
+        // resumes. If the refresh happened before the poll instead of after,
+        // every observation taken in that drain would be stale by the sleep
+        // and a fast request would land in a 100 ms bucket.
+        std::chrono::steady_clock::duration skew{};
+        spawn([](event_loop& l, std::chrono::steady_clock::duration& out) -> task<void> {
+          (void)co_await l.sleep_for(60ms);  // forces a real blocking poll
+          out = std::chrono::steady_clock::now() - l.now();
+        }(loop, skew));
+        loop.run();
+        CHECK(skew >= std::chrono::steady_clock::duration::zero());
+        CHECK(skew < 10ms);  // one drain's worth, nowhere near the 60 ms slept
+      }
+
       SECTION("schedule yields FIFO between two tasks") {
         std::string order;
         auto worker = [](event_loop& l, std::string& out, char tag) -> task<void> {

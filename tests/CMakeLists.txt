@@ -7,6 +7,7 @@ add_executable(vkp_tests
   core/buffer_test.cpp
   core/byte_queue_test.cpp
   core/log_test.cpp
+  core/metrics_test.cpp
   io/event_loop_test.cpp
   io/task_test.cpp
   io/wait_queue_test.cpp

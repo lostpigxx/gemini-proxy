@@ -108,6 +108,17 @@ class event_loop {
   [[nodiscard]] bool stopping() const noexcept { return stopping_; }
   [[nodiscard]] std::string_view backend_name() const noexcept { return backend_->name(); }
 
+  // The clock, cached once per loop iteration. run() refreshes it right after
+  // poll() returns and again in expire_timers(), so anything resumed by this
+  // loop sees a value at most one ready-queue drain old — microseconds under
+  // load, against a 100 µs smallest histogram bucket.
+  //
+  // This is for metrics. Deadline arithmetic that must not drift (backend
+  // request timeouts, connect timeouts) keeps reading the real clock: a drain
+  // that resumes thousands of coroutines would otherwise judge the tail of the
+  // batch against the timestamp the head was resumed with.
+  [[nodiscard]] std::chrono::steady_clock::time_point now() const noexcept { return now_; }
+
  private:
   friend class io_awaiter;
   friend class wait_queue;
@@ -135,6 +146,7 @@ class event_loop {
   std::vector<timer_entry> timers_;    // heap via std::push_heap/pop_heap
   wait_queue* wait_queues_ = nullptr;  // intrusive registry (see wait_queue)
   std::size_t parked_waiters_ = 0;
+  std::chrono::steady_clock::time_point now_ = std::chrono::steady_clock::now();
   bool stopping_ = false;
 };
 

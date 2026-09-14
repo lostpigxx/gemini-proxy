@@ -52,19 +52,24 @@ admin 线程抓取 `/metrics` 时要读到每个 worker 的计数器。两条路
 于是自增可以写成 relaxed load + relaxed store，而不是 `fetch_add`：
 
 ```cpp
-struct alignas(64) counter {              // 每 worker 一块，cache line 独占
-  std::atomic<std::uint64_t> v{0};
+class counter {
+  std::atomic<std::uint64_t> v_{0};
+ public:
   void bump(std::uint64_t n = 1) noexcept {        // 只有 owner 线程调用
-    v.store(v.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+    v_.store(v_.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
   }
   std::uint64_t read() const noexcept {            // admin 线程
-    return v.load(std::memory_order_relaxed);
+    return v_.load(std::memory_order_relaxed);
   }
 };
 ```
 
 arm64 上这编译成普通 `LDR` + `STR`，没有 `LDADD`，没有屏障——与非原子变量的代价
-相同，但 TSan 干净、语义有定义。cache line 对齐保证 worker 之间不会互相 false sharing。
+相同，但 TSan 干净、语义有定义。
+
+**对齐加在 `worker_stats` 这一整块上，而不是每个 counter 上**（`class alignas(64)
+worker_stats`）。false sharing 只可能发生在 worker **之间**：一块之内只有一个写者，
+所以块内不需要填充，紧凑反而让热路径少碰几条 cache line。
 
 代价是抓取到的一组计数器**不是同一时刻的原子快照**（worker A 的 requests 可能比
 worker B 的新几微秒）。对 Prometheus 这种按 `rate()` 消费的系统完全无所谓。
@@ -78,15 +83,14 @@ worker B 的新几微秒）。对 Prometheus 这种按 `rate()` 消费的系统�
 朴素做法是每请求 2~4 次 `steady_clock::now()`，每次约 20 ns 的 vDSO 调用，相对
 ~2 µs 的每请求预算是 2~4%。M6 正要去抠这些，M5 不能先在这里加回来。
 
-两处观察让它降到零：
+两处观察让**每请求**的读取次数降到零：
 
 **后端侧本来就有现成的时间戳。** `backend_conn::push()` 已经算了
 `deadline = now + request_timeout`，`deliver_head()` 已经为 `last_activity_` 算了一次
 `now()`。于是后端时延 = `now - (deadline - cfg_.request_timeout)`，两个值都在手上，
 一次新的时钟读取都不需要。
 
-**proxy 侧改用 loop 缓存的时间。** `event_loop::run()` 每轮迭代都会在 `expire_timers()`
-里调一次 `steady_clock::now()`。把它存进成员并公开：
+**proxy 侧改用 loop 缓存的时间。** 公开 `event_loop::now()`：
 
 ```cpp
 [[nodiscard]] std::chrono::steady_clock::time_point now() const noexcept { return now_; }
@@ -94,6 +98,21 @@ worker B 的新几微秒）。对 Prometheus 这种按 `rate()` 消费的系统�
 
 精度就是一轮迭代——重负载下是微秒级，而直方图最小的桶是 100 µs，绰绰有余。
 请求时间戳存进 `client_conn::reply_slot`（每槽 8 字节）。
+
+**代价是每轮迭代 2 次读取，不是 1 次——实现时发现的。** 原计划是直接复用
+`expire_timers()` 里那一次，但 `run()` 的顺序是「drain ready → expire_timers → poll」：
+`expire_timers()` 取的时刻在 `poll()` **之前**，而 `poll()` 可能一直阻塞到下一个定时器
+到期。空闲时它能睡上百毫秒，于是下一轮 drain 里所有协程读到的 `now_` 会陈旧同样的量级
+——一个真正 50 µs 的请求会被记进 100 ms 的桶。
+
+所以 `now_` 在两处刷新：`run()` 每轮迭代顶部（`poll()` 刚返回、任何协程 resume 之前）
+和 `expire_timers()` 里。定时器判定**继续用自己那次真实读取**，不改成 `now_`：
+`expire_timers()` 跑在 drain 之后，若用 drain 之前的时刻会让所有定时器晚触发一个 drain
+的时长。
+
+两次读取分摊在整批 completion 上（重载下一轮迭代处理几十上百个请求），而朴素做法是
+每请求 2~4 次。这仍然是正确的那一侧的权衡，只是「零 syscall」应该准确表述为
+**每请求零、每轮迭代二**。
 
 **只给 metrics 用。** `backend_conn` 的超时判定继续用真实 `steady_clock::now()`：
 一次 ready 队列的批量 drain 可能 resume 上千个协程，用缓存时间会让队尾的超时判定

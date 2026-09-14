@@ -114,7 +114,11 @@ void event_loop::cancel_op(operation& op) noexcept {
 }
 
 std::optional<std::chrono::nanoseconds> event_loop::expire_timers() {
+  // Deliberately the real clock, not now_: this runs after the ready-queue
+  // drain, and judging deadlines against a value taken before it would fire
+  // every timer late by the length of the drain.
   const auto now = std::chrono::steady_clock::now();
+  now_ = now;
   while (!timers_.empty() && timers_.front().deadline <= now) {
     std::pop_heap(timers_.begin(), timers_.end());
     operation* op = timers_.back().op;
@@ -130,6 +134,12 @@ std::optional<std::chrono::nanoseconds> event_loop::expire_timers() {
 
 void event_loop::run() {
   for (;;) {
+    // Before anything resumes, not after: poll() below can block for as long
+    // as the next timer allows, and every coroutine woken by this drain reads
+    // now() for its latency accounting. The pair of reads per iteration
+    // amortises over the whole completion batch — the point is to keep the
+    // per-request count at zero.
+    now_ = std::chrono::steady_clock::now();
     while (operation* op = ready_.pop()) {
       op->continuation.resume();
     }
