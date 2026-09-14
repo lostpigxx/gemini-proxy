@@ -8,11 +8,8 @@
 #include <CLI/CLI.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
-#include <quill/Backend.h>
-#include <quill/Frontend.h>
-#include <quill/LogMacros.h>
-#include <quill/sinks/ConsoleSink.h>
 
+#include "core/log.hpp"
 #include "core/version.hpp"
 #include "io/backend.hpp"
 #include "proxy/server.hpp"
@@ -95,11 +92,27 @@ int main(int argc, char** argv) {
                  "Per-request timeout, enqueue to response")
       ->capture_default_str();
 
+  vkp::log::options log_opt;
+  std::string log_format = "text";
+  app.add_option("--log-level", log_opt.level, "Log level")
+      ->check(CLI::IsMember({"tracel3", "tracel2", "tracel1", "debug", "info", "warning", "error",
+                             "critical", "none"}))
+      ->capture_default_str();
+  app.add_option("--log-format", log_format, "Log output format")
+      ->check(CLI::IsMember({"text", "json"}))
+      ->capture_default_str();
+  app.add_option("--log-file", log_opt.file, "Log to this file instead of stdout");
+
   CLI11_PARSE(app, argc, argv);
 
-  quill::Backend::start();
-  auto sink = quill::Frontend::create_or_get_sink<quill::ConsoleSink>("console");
-  auto* logger = quill::Frontend::create_or_get_logger("root", std::move(sink));
+  log_opt.fmt = log_format == "json" ? vkp::log::format::json : vkp::log::format::text;
+  try {
+    vkp::log::init(log_opt);
+  } catch (const std::exception& e) {
+    // No logger yet, so this one genuinely has to go to stderr.
+    fmt::print(stderr, "fatal: {}\n", e.what());
+    return EXIT_FAILURE;
+  }
 
   try {
     vkp::proxy::worker_pool::options opt;
@@ -141,21 +154,21 @@ int main(int argc, char** argv) {
         cluster_seeds.empty()
             ? fmt::format("backend {}:{}", opt.cfg.backend_host, opt.cfg.backend_port)
             : fmt::format("cluster seeds {}", fmt::join(cluster_seeds, ","));
-    LOG_INFO(logger,
-             "valkey-proxy {} listening on {}:{} -> {} "
-             "({} worker(s), {} conn(s)/backend, io: {})",
-             vkp::kVersion, opt.cfg.listen_host, pool.port(), upstream, pool.workers(),
-             conns_per_backend, pool.io_backend_name());
+    VKP_LOG_INFO(
+        "valkey-proxy {version} listening on {host}:{port} -> {upstream} "
+        "({workers} worker(s), {conns_per_backend} conn(s)/backend, io: {io_backend})",
+        vkp::kVersion, opt.cfg.listen_host, pool.port(), upstream, pool.workers(),
+        conns_per_backend, pool.io_backend_name());
 
     pool.run();
 
-    LOG_INFO(logger, "shutdown complete");
+    VKP_LOG_INFO("shutdown complete");
   } catch (const std::exception& e) {
-    LOG_ERROR(logger, "fatal: {}", e.what());
-    quill::Backend::stop();
+    VKP_LOG_ERROR("fatal: {}", e.what());
+    vkp::log::shutdown();
     return EXIT_FAILURE;
   }
 
-  quill::Backend::stop();
+  vkp::log::shutdown();
   return EXIT_SUCCESS;
 }

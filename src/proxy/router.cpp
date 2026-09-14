@@ -8,6 +8,7 @@
 
 #include <fmt/format.h>
 
+#include "core/log.hpp"
 #include "resp/value.hpp"
 
 namespace vkp::proxy {
@@ -202,14 +203,31 @@ void router::request_refresh() noexcept {
 }
 
 void router::adopt(cluster::topology t) {
+  // The refresh runs on a timer, so only an actual change is worth a line;
+  // otherwise this is the same sentence every refresh_interval forever.
+  const std::size_t was_nodes = topology_.nodes().size();
+  const std::size_t was_slots = topology_.assigned_slots();
+  const bool changed = t.nodes() != topology_.nodes() || t.assigned_slots() != was_slots;
+
   std::vector<node_conns*> fresh;
   fresh.reserve(t.nodes().size());
   for (const cluster::node& n : t.nodes()) {
-    fresh.push_back(try_ensure_node(n.host, n.port));
+    node_conns* node = try_ensure_node(n.host, n.port);
+    if (node == nullptr) {
+      VKP_LOG_WARN("topology: cannot resolve node {host}:{port}, its slots are unserved", n.host,
+                   n.port);
+    }
+    fresh.push_back(node);
   }
   topology_ = std::move(t);
   by_index_ = std::move(fresh);
   next_any_ = 0;
+  if (changed) {
+    VKP_LOG_INFO(
+        "topology: {nodes} node(s), {slots} slot(s) assigned "
+        "(was {was_nodes} node(s), {was_slots} slot(s))",
+        topology_.nodes().size(), topology_.assigned_slots(), was_nodes, was_slots);
+  }
   retire_unreferenced();
 }
 
@@ -217,6 +235,8 @@ void router::retire_unreferenced() {
   for (auto it = pool_.begin(); it != pool_.end();) {
     const auto next = std::next(it);
     if (std::find(by_index_.begin(), by_index_.end(), &it->second) == by_index_.end()) {
+      VKP_LOG_INFO("topology: retiring node {node}, draining {conns} connection(s)", it->first,
+                   it->second.conns.size());
       for (const auto& c : it->second.conns) {
         c->begin_drain();
       }
@@ -312,6 +332,11 @@ io::task<void> router::refresher() {
       // rather than hammering an unreachable seed.
       retry_ = retry_ == 0ms ? cfg_.backend.backoff_base
                              : std::min(retry_ * 2, cfg_.backend.backoff_max);
+      // Rate-limited: with the backoff capped at 2 s an unreachable cluster
+      // would otherwise produce a line every two seconds indefinitely.
+      VKP_LOG_WARN_EVERY(10s,
+                         "topology: CLUSTER SHARDS failed on every node, retry in {retry_ms} ms",
+                         retry_.count());
       if (!co_await nap(retry_, refresh_nap_)) {
         break;
       }

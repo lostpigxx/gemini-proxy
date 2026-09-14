@@ -1,5 +1,6 @@
 #include "io/socket.hpp"
 
+#include <arpa/inet.h>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -68,6 +69,22 @@ resolved_addr resolve_tcp(const std::string& host, std::uint16_t port) {
   out.len = static_cast<socklen_t>(list->ai_addrlen);
   ::freeaddrinfo(list);
   return out;
+}
+
+std::string to_string(const resolved_addr& addr) {
+  char host[INET6_ADDRSTRLEN] = {};
+  if (addr.addr.ss_family == AF_INET) {
+    const auto* v4 = reinterpret_cast<const sockaddr_in*>(&addr.addr);
+    if (::inet_ntop(AF_INET, &v4->sin_addr, host, sizeof(host)) != nullptr) {
+      return fmt::format("{}:{}", host, ntohs(v4->sin_port));
+    }
+  } else if (addr.addr.ss_family == AF_INET6) {
+    const auto* v6 = reinterpret_cast<const sockaddr_in6*>(&addr.addr);
+    if (::inet_ntop(AF_INET6, &v6->sin6_addr, host, sizeof(host)) != nullptr) {
+      return fmt::format("[{}]:{}", host, ntohs(v6->sin6_port));
+    }
+  }
+  return "<unknown>";
 }
 
 unique_fd listen_tcp(const std::string& host, std::uint16_t port, int backlog, bool reuseport) {

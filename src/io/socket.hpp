@@ -46,6 +46,10 @@ struct resolved_addr {
 // Throws std::runtime_error on resolver failure.
 [[nodiscard]] resolved_addr resolve_tcp(const std::string& host, std::uint16_t port);
 
+// "host:port" for logs and admin output ("[::1]:6379" for IPv6). Returns
+// "<unknown>" for a family it cannot print. Never throws, never blocks.
+[[nodiscard]] std::string to_string(const resolved_addr& addr);
+
 // Nonblocking + cloexec listener with SO_REUSEADDR; port 0 picks an
 // ephemeral port (see local_port). `reuseport` additionally sets
 // SO_REUSEPORT before bind (per-worker listeners, kernel load balancing).

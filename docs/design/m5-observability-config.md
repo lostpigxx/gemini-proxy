@@ -18,6 +18,24 @@ M5 补齐这一面。它同时是 M6 的前置——M6 要「用数据驱动优�
 待解释的性能缺口（cluster 模式只有 standalone 的 57~58%，怀疑是写合并被打散）。
 没有延迟直方图，这个怀疑就只能停留在怀疑。
 
+### 0.1 日志：命名占位符，不是位置占位符
+
+所有埋点一律写成 `VKP_LOG_WARN("backend {backend}: connect failed: {error}", addr, err)`
+而不是 `{}`。代价是每条语句长一点，买到的是 `--log-format json` 下每个值自动变成
+一个独立字段：
+
+```json
+{"log_level":"WARNING","message":"backend {backend}: connect failed: {error} (retry in {retry_ms} ms) ({occurred}x)",
+ "backend":"127.0.0.1:7099","error":"Connection refused","retry_ms":"50","occurred":"1"}
+```
+
+注意 JSON 模式下 `message` 保留的是**模板原文**而不是插值后的句子——这是 quill 的
+JsonSink 的设计，也正是 log shipper 想要的：模板是稳定的「事件类型」，可以直接
+group by，值在各自的字段里。人眼看日志用 text 模式。
+
+限速宏 `VKP_LOG_WARN_EVERY` 会自动附上 `({occurred}x)`，所以被压掉的那些不是消失，
+而是折叠成了计数。
+
 ## 1. 指标怎么跨线程读：松弛原子 + 单写者
 
 这是 M5 唯一动摇既有不变量的地方，所以先说清楚。

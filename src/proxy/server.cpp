@@ -17,6 +17,7 @@
 #include "cluster/slot.hpp"
 #include "core/buffer.hpp"
 #include "core/byte_queue.hpp"
+#include "core/log.hpp"
 #include "core/version.hpp"
 #include "io/wait_queue.hpp"
 #include "proxy/command_table.hpp"
@@ -328,11 +329,18 @@ class client_conn final : public reply_sink {
       return;
     }
     if (s.redirects >= max_redirects_) {
+      VKP_LOG_WARN_EVERY(
+          1s, "redirect: giving up after {hops} hops, slot {slot} last pointed at {host}:{port}",
+          max_redirects_, r.slot, r.host, r.port);
       fill(index, kErrTooManyRedirects);
       return;
     }
     ++s.redirects;
     if (r.moved) {
+      // Rate-limited hard: a resharding cluster emits MOVED by the thousand,
+      // and one line per redirect would bury every other event in the log.
+      VKP_LOG_WARN_EVERY(1s, "redirect: slot {slot} moved to {host}:{port}", r.slot, r.host,
+                         r.port);
       // Repoint the slot now; the debounced refresh picks up the rest.
       router_.apply_moved(r.slot, r.host, r.port);
     }
@@ -550,20 +558,27 @@ server::server(io::event_loop& loop, config cfg)
 void server::start() {
   router_.start();  // pool warmup: connecting begins now
   io::spawn(acceptor());
+  VKP_LOG_DEBUG("worker listening on {host}:{port}", cfg_.listen_host, port_);
 }
 
 void server::begin_shutdown() {
   if (draining_) {
+    VKP_LOG_WARN("second shutdown request: stopping now, {open} connection(s) still open", active_);
     loop_.stop();  // second request: no more grace
     return;
   }
   draining_ = true;
+  VKP_LOG_INFO("draining: no longer accepting, {inflight} connection(s) in flight", active_);
   loop_.cancel(accept_cancel_);
   io::spawn(watchdog());
 }
 
 io::task<void> server::watchdog() {
   (void)co_await loop_.sleep_for(cfg_.shutdown_grace);
+  if (active_ != 0) {
+    VKP_LOG_WARN("shutdown grace of {grace_ms} ms expired with {open} connection(s) still open",
+                 cfg_.shutdown_grace.count(), active_);
+  }
   loop_.stop();  // idempotent; a clean drain already stopped the loop
 }
 
@@ -575,7 +590,9 @@ io::task<void> server::acceptor() {
     }
     if (fd < 0) {
       // EMFILE and friends: pause briefly instead of spinning on the error.
-      fmt::print(stderr, "accept failed: {}\n", std::strerror(-fd));
+      // Rate-limited because the condition that causes it (fd exhaustion)
+      // persists, and one line per failed accept would bury everything else.
+      VKP_LOG_WARN_EVERY(1s, "accept failed on port {port}: {error}", port_, std::strerror(-fd));
       (void)co_await loop_.sleep_for(100ms);
       continue;
     }
@@ -588,6 +605,9 @@ io::task<void> server::acceptor() {
 
 io::task<void> server::connection(io::unique_fd client) {
   ++active_;
+  // Debug level on purpose: at connection-churn rates this is the one control
+  // -plane event frequent enough to cost something, so it stays off by default.
+  VKP_LOG_DEBUG("client connected on port {port}, {open} open", port_, active_);
   {
     client_conn c{loop_, std::move(client), router_, cfg_.client_outbuf_limit, cfg_.max_redirects};
     try {
@@ -597,6 +617,7 @@ io::task<void> server::connection(io::unique_fd client) {
     }
   }
   --active_;
+  VKP_LOG_DEBUG("client disconnected on port {port}, {open} open", port_, active_);
   maybe_drain_backends();
 }
 
@@ -611,6 +632,7 @@ void server::maybe_drain_backends() {
 io::task<void> server::drain_backends() {
   router_.begin_drain();
   co_await router_.await_drained();
+  VKP_LOG_INFO("drained cleanly: all clients served, backend pool closed");
   loop_.stop();
 }
 

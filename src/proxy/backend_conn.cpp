@@ -3,13 +3,18 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <cstring>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <utility>
 
+#include "core/log.hpp"
+
 namespace vkp::proxy {
 
 namespace {
+
+using namespace std::chrono_literals;
 
 constexpr std::string_view kHealthPing = "*1\r\n$4\r\nPING\r\n";
 
@@ -154,10 +159,36 @@ io::task<void> backend_conn::read_responses() {
   for (;;) {
     const frame_result r = co_await read_frame(loop_, fd_.get(), in_, parser_, &recv_slot_);
     if (r.k != frame_result::kind::frame) {
-      co_return;  // eof / io error / -ECANCELED (timeout kill, drain) / garbage
+      // This is the one place that knows *why* a session ended; the driver
+      // above only sees that it did. -ECANCELED is our own doing (timeout
+      // kill or drain) and the caller already logs those, hence debug.
+      switch (r.k) {
+        case frame_result::kind::eof:
+          VKP_LOG_INFO("backend {backend}: closed the connection, {inflight} request(s) in flight",
+                       io::to_string(addr_), inflight_.size());
+          break;
+        case frame_result::kind::io_error:
+          if (r.err == -ECANCELED) {
+            VKP_LOG_DEBUG("backend {backend}: read cancelled", io::to_string(addr_));
+          } else {
+            VKP_LOG_WARN("backend {backend}: read failed: {error}", io::to_string(addr_),
+                         std::strerror(-r.err));
+          }
+          break;
+        case frame_result::kind::protocol_error:
+          VKP_LOG_WARN("backend {backend}: malformed response frame", io::to_string(addr_));
+          break;
+        case frame_result::kind::frame:
+          break;  // unreachable
+      }
+      co_return;
     }
     if (inflight_.empty()) {
-      co_return;  // unsolicited frame: backend out of sync, rebuild
+      // Not a transport hiccup: the backend sent a frame we never asked for,
+      // so FIFO pairing can no longer be trusted. Worth a line every time.
+      VKP_LOG_WARN("backend {backend}: unsolicited response, rebuilding connection",
+                   io::to_string(addr_));
+      co_return;
     }
     deliver_head(in_.readable().substr(0, r.len));
     in_.consume(r.len);
@@ -188,6 +219,10 @@ io::task<void> backend_conn::driver() {
       s.reset();
       state_ = state::down;
       poke_watchdog();
+      // Rate-limited: a backend that is down stays down, and the backoff caps
+      // at 2 s, so an unlimited line here is one every two seconds forever.
+      VKP_LOG_WARN_EVERY(5s, "backend {backend}: connect failed: {error} (retry in {retry_ms} ms)",
+                         io::to_string(addr_), std::strerror(-rc), backoff_.count());
       fail_all();  // requests queued while we were connecting
       if (!co_await backoff_wait()) {
         break;
@@ -199,6 +234,7 @@ io::task<void> backend_conn::driver() {
     fd_ = std::move(s);
     state_ = state::connected;
     session_was_connected_ = true;
+    VKP_LOG_INFO("backend {backend}: connected", io::to_string(addr_));
     backoff_ = cfg_.backoff_base;
     last_activity_ = std::chrono::steady_clock::now();
     poke_watchdog();
@@ -328,6 +364,8 @@ io::task<void> backend_conn::watchdog() {
     switch (reason) {
       case why::connect:
         if (state_ == state::connecting && fired >= connect_deadline_) {
+          VKP_LOG_WARN_EVERY(5s, "backend {backend}: connect timed out after {timeout_ms} ms",
+                             io::to_string(addr_), cfg_.connect_timeout.count());
           loop_.cancel(connect_slot_);
           // Park until the driver moves on; avoids a hot revalidation loop.
           park_failed = co_await wake_watchdog_.wait() < 0;
@@ -336,6 +374,12 @@ io::task<void> backend_conn::watchdog() {
       case why::request:
         if (state_ == state::connected && !inflight_.empty() &&
             fired >= inflight_.front().deadline) {
+          // Rate-limited: one slow backend times out its whole pipeline at
+          // once, and the rebuild that follows is the line worth keeping.
+          VKP_LOG_WARN_EVERY(
+              5s,
+              "backend {backend}: request timed out after {timeout_ms} ms, {inflight} in flight",
+              io::to_string(addr_), cfg_.request_timeout.count(), inflight_.size());
           head_timed_out_ = true;
           loop_.cancel(recv_slot_);  // driver fails the queue and rebuilds
           park_failed = co_await wake_watchdog_.wait() < 0;
