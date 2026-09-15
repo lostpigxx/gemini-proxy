@@ -13,6 +13,7 @@
 
 #include "cluster/slot.hpp"
 #include "core/buffer.hpp"
+#include "core/metrics.hpp"
 #include "io/event_loop.hpp"
 #include "io/socket.hpp"
 #include "io/task.hpp"
@@ -25,6 +26,14 @@ namespace proxy = vkp::proxy;
 namespace cluster = vkp::cluster;
 
 namespace {
+
+// Instrumentation is a required constructor argument so that production
+// wiring cannot silently be forgotten. Cases that do not assert on metrics
+// share this block; Catch2 runs cases sequentially, so it needs no locking.
+vkp::metrics::worker_stats& scratch_stats() {
+  static vkp::metrics::worker_stats s;
+  return s;
+}
 
 std::vector<std::string_view> argv(std::initializer_list<std::string_view> args) {
   return {args};
@@ -165,7 +174,7 @@ TEST_CASE("parse_endpoint splits host and port", "[router]") {
 TEST_CASE("standalone is one node owning every slot", "[router]") {
   io::event_loop loop;
   proxy::router_config cfg;  // defaults are standalone against 127.0.0.1:6379
-  proxy::router r{loop, cfg};
+  proxy::router r{loop, cfg, scratch_stats()};
 
   CHECK_FALSE(r.cluster_mode());
   CHECK_FALSE(r.may_redirect());  // no MOVED possible: clients skip the retry copy
@@ -188,7 +197,7 @@ TEST_CASE("a node's connections are handed out round-robin", "[router]") {
   io::event_loop loop;
   proxy::router_config cfg;
   cfg.conns_per_node = 2;
-  proxy::router r{loop, cfg};
+  proxy::router r{loop, cfg, scratch_stats()};
 
   const auto first = r.route(argv({"GET", "k"}), proxy::find_command("GET"));
   const auto second = r.route(argv({"GET", "k"}), proxy::find_command("GET"));
@@ -201,7 +210,7 @@ TEST_CASE("cluster mode without a topology refuses instead of queueing", "[route
   io::event_loop loop;
   proxy::router_config cfg;
   cfg.cluster_seeds = {"127.0.0.1:7000"};
-  proxy::router r{loop, cfg};
+  proxy::router r{loop, cfg, scratch_stats()};
 
   CHECK(r.cluster_mode());
   CHECK(r.may_redirect());
@@ -216,7 +225,7 @@ TEST_CASE("cluster mode classifies commands before it needs a topology", "[route
   io::event_loop loop;
   proxy::router_config cfg;
   cfg.cluster_seeds = {"127.0.0.1:7000"};
-  proxy::router r{loop, cfg};
+  proxy::router r{loop, cfg, scratch_stats()};
 
   // Refused outright, whatever the topology says.
   CHECK(r.route(argv({"SCAN", "0"}), proxy::find_command("SCAN")).st ==
@@ -241,7 +250,7 @@ TEST_CASE("the router bootstraps from a seed and routes by slot", "[router]") {
   proxy::router_config cfg;
   cfg.cluster_seeds = {fmt::format("127.0.0.1:{}", n0.port)};
   cfg.refresh_interval = 30ms;
-  proxy::router r{loop, cfg};
+  proxy::router r{loop, cfg, scratch_stats()};
   r.start();
 
   io::spawn([](io::event_loop& l, proxy::router& rtr, const fake_node& a,
@@ -298,7 +307,7 @@ TEST_CASE("a node that leaves the topology is retired, not dropped", "[router]")
   proxy::router_config cfg;
   cfg.cluster_seeds = {fmt::format("127.0.0.1:{}", n0.port)};
   cfg.refresh_interval = 20ms;
-  proxy::router r{loop, cfg};
+  proxy::router r{loop, cfg, scratch_stats()};
   r.start();
 
   io::spawn([](io::event_loop& l, proxy::router& rtr, fake_node& a,
@@ -335,7 +344,7 @@ TEST_CASE("MOVED repoints a single slot right away", "[router]") {
   proxy::router_config cfg;
   cfg.cluster_seeds = {fmt::format("127.0.0.1:{}", n0.port)};
   cfg.refresh_interval = 10s;  // long: only the MOVED path may change anything
-  proxy::router r{loop, cfg};
+  proxy::router r{loop, cfg, scratch_stats()};
   r.start();
 
   io::spawn([](io::event_loop& l, proxy::router& rtr, const fake_node& a,
@@ -362,4 +371,20 @@ TEST_CASE("MOVED repoints a single slot right away", "[router]") {
   }(loop, r, n0, n1));
 
   loop.run();
+}
+
+TEST_CASE("the router publishes its topology for /topology to read", "[router][metrics]") {
+  vkp::metrics::worker_stats stats;
+  io::event_loop loop;
+  proxy::router_config cfg;  // standalone: one node, every slot, never refreshed
+  proxy::router r{loop, cfg, stats};
+
+  CHECK(stats.topology_nodes.read() == 1);
+  CHECK(stats.topology_slots_assigned.read() == cluster::kSlotCount);
+
+  const auto [text, age] = stats.topology_snapshot(std::chrono::steady_clock::now());
+  // One contiguous run, one line — the whole point of coalescing runs instead
+  // of printing 16384 of them.
+  CHECK(text == "0-16383 127.0.0.1:6379\n");
+  CHECK(age >= std::chrono::steady_clock::duration::zero());
 }

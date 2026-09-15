@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <iterator>
 #include <stdexcept>
 #include <utility>
 
@@ -53,8 +54,8 @@ void router::probe::deliver(std::uint64_t /*token*/, std::string_view frame) {
   wake->notify_all();
 }
 
-router::router(io::event_loop& loop, router_config cfg)
-    : loop_(loop), cfg_(std::move(cfg)), probe_wake_(loop), finished_(loop) {
+router::router(io::event_loop& loop, router_config cfg, metrics::worker_stats& stats)
+    : loop_(loop), cfg_(std::move(cfg)), stats_(stats), probe_wake_(loop), finished_(loop) {
   if (cfg_.conns_per_node == 0) {
     cfg_.conns_per_node = 1;
   }
@@ -73,6 +74,7 @@ router::router(io::event_loop& loop, router_config cfg)
   t.assign(0, cluster::kSlotCount - 1, idx);
   topology_ = std::move(t);
   by_index_ = {&only};
+  publish_topology();  // never refreshed, so this is the only chance
 }
 
 router::~router() = default;
@@ -104,7 +106,7 @@ router::node_conns& router::ensure_node(std::string_view host, std::uint16_t por
   for (std::size_t i = 0; i < cfg_.conns_per_node; ++i) {
     // node.addr is held by reference, which is why node_conns lives in a map
     // node and is never moved again.
-    node.conns.push_back(std::make_shared<backend_conn>(loop_, node.addr, cfg_.backend));
+    node.conns.push_back(std::make_shared<backend_conn>(loop_, node.addr, cfg_.backend, stats_));
     if (started_) {
       node.conns.back()->start();
     }
@@ -228,7 +230,35 @@ void router::adopt(cluster::topology t) {
         "(was {was_nodes} node(s), {was_slots} slot(s))",
         topology_.nodes().size(), topology_.assigned_slots(), was_nodes, was_slots);
   }
+  publish_topology();
   retire_unreferenced();
+}
+
+void router::publish_topology() {
+  stats_.topology_nodes.set(topology_.nodes().size());
+  stats_.topology_slots_assigned.set(topology_.assigned_slots());
+
+  // Contiguous runs rather than 16384 lines. A healthy three-master cluster
+  // renders in three lines; a mid-resharding one fragments, and seeing that
+  // fragmentation is the point of the page.
+  std::string out;
+  const auto& nodes = topology_.nodes();
+  std::size_t begin = 0;
+  for (std::size_t slot = 1; slot <= cluster::kSlotCount; ++slot) {
+    const std::int16_t owner = topology_.owner_of(static_cast<std::uint16_t>(begin));
+    if (slot < cluster::kSlotCount &&
+        topology_.owner_of(static_cast<std::uint16_t>(slot)) == owner) {
+      continue;
+    }
+    if (owner >= 0 && static_cast<std::size_t>(owner) < nodes.size()) {
+      const cluster::node& n = nodes[static_cast<std::size_t>(owner)];
+      fmt::format_to(std::back_inserter(out), "{}-{} {}:{}\n", begin, slot - 1, n.host, n.port);
+    } else {
+      fmt::format_to(std::back_inserter(out), "{}-{} unassigned\n", begin, slot - 1);
+    }
+    begin = slot;
+  }
+  stats_.publish_topology(std::move(out), loop_.now());
 }
 
 void router::retire_unreferenced() {
@@ -319,6 +349,7 @@ io::task<void> router::refresher() {
     if (draining_) {
       break;
     }
+    stats_.bump_refresh(ok ? metrics::refresh_result::ok : metrics::refresh_result::fail);
     if (ok) {
       retry_ = 0ms;
       if (refresh_pending_) {

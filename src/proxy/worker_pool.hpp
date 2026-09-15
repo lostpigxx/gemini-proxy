@@ -9,6 +9,7 @@
 #include <optional>
 #include <vector>
 
+#include "core/metrics.hpp"
 #include "io/backend.hpp"
 #include "io/event_loop.hpp"
 #include "proxy/server.hpp"
@@ -49,9 +50,19 @@ class worker_pool {
   // from a signal handler (write one byte to each).
   [[nodiscard]] const std::vector<int>& shutdown_fds() const noexcept { return wake_write_fds_; }
 
+  // Every worker's counter block. The pool owns it because it outlives no one
+  // else: the admin thread scrapes it while the workers run, and the blocks
+  // must not move once a server holds a reference (design m5 §1).
+  [[nodiscard]] metrics::registry& stats() noexcept { return stats_; }
+  [[nodiscard]] const metrics::registry& stats() const noexcept { return stats_; }
+
  private:
   struct worker;
 
+  // workers == 0 means "one per core"; resolved before stats_ is sized.
+  [[nodiscard]] static std::size_t resolve_workers(std::size_t requested) noexcept;
+
+  metrics::registry stats_;
   std::vector<std::unique_ptr<worker>> workers_;
   std::vector<int> wake_write_fds_;
   bool cpu_affinity_ = false;

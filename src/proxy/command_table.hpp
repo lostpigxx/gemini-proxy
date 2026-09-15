@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/metrics.hpp"
+
 namespace vkp::proxy {
 
 // Standalone-mode disposition. Unchanged since M3; cluster mode consults
@@ -30,6 +32,10 @@ struct command_info {
   std::string_view name;  // uppercase
   cmd_policy policy = cmd_policy::forward;
   cluster_policy cluster = cluster_policy::unsupported;
+  // Metrics bucket only — routing never reads it. Deliberately coarse: one
+  // series per command name would be ~200 × N workers for a diagnostic value
+  // a proxy does not have (design m5 §4).
+  metrics::cmd_class cls = metrics::cmd_class::other;
   // Key spec, redis convention: 1-based argv indices (argv[0] is the command
   // name), last_key -1 means "through the last argument", key_step is the
   // distance between consecutive keys. first_key 0 = no range spec.

@@ -47,10 +47,11 @@ io::task<frame_result> read_frame(io::event_loop& loop, int fd, read_buffer& buf
 }
 
 backend_conn::backend_conn(io::event_loop& loop, const io::resolved_addr& addr,
-                           const backend_conn_config& cfg)
+                           const backend_conn_config& cfg, metrics::worker_stats& stats)
     : loop_(loop),
       addr_(addr),
       cfg_(cfg),
+      stats_(stats),
       backoff_(cfg.backoff_base),
       capacity_(loop),
       out_ready_(loop),
@@ -59,9 +60,22 @@ backend_conn::backend_conn(io::event_loop& loop, const io::resolved_addr& addr,
       finished_(loop) {}
 
 void backend_conn::start() {
+  state_counted_ = true;
+  stats_.backend_conns(gauge_state(state_)).inc();
   io::spawn(driver());
   io::spawn(writer());
   io::spawn(watchdog());
+}
+
+void backend_conn::set_state(state s) noexcept {
+  if (s == state_) {
+    return;
+  }
+  if (state_counted_) {
+    stats_.backend_conns(gauge_state(state_)).dec();
+    stats_.backend_conns(gauge_state(s)).inc();
+  }
+  state_ = s;
 }
 
 void backend_conn::push(reply_sink* sink, std::uint64_t token, std::string_view frame) {
@@ -70,6 +84,7 @@ void backend_conn::push(reply_sink* sink, std::uint64_t token, std::string_view 
   const auto now = std::chrono::steady_clock::now();
   out_.append(frame);
   inflight_.push_back({.sink = sink, .token = token, .deadline = now + cfg_.request_timeout});
+  stats_.backend_inflight.inc();
   last_activity_ = now;
   out_ready_.notify_one();
   if (was_empty) {
@@ -118,10 +133,17 @@ void backend_conn::poke_watchdog() noexcept {
 void backend_conn::deliver_head(std::string_view frame) {
   const entry e = inflight_.front();
   inflight_.pop_front();
+  stats_.backend_inflight.dec();
+  // Sampled before deliver(), which hands the frame to the client and can run
+  // a whole flush — that work is proxy time, not backend time. The start
+  // stamp is recovered from the deadline push() already computed, so backend
+  // latency costs no clock read of its own (design m5 §2).
+  const auto now = std::chrono::steady_clock::now();
+  stats_.backend_duration.observe(now - (e.deadline - cfg_.request_timeout));
   if (e.sink != nullptr) {
     e.sink->deliver(e.token, frame);
   }
-  last_activity_ = std::chrono::steady_clock::now();
+  last_activity_ = now;
   if (inflight_.empty()) {
     poke_watchdog();  // switch from the (stale) head deadline to idle timing
   }
@@ -135,6 +157,10 @@ void backend_conn::fail_all() noexcept {
   while (!inflight_.empty()) {
     const entry e = inflight_.front();
     inflight_.pop_front();
+    stats_.backend_inflight.dec();
+    // No backend_duration sample: these never got an answer, and folding a
+    // timeout into the latency histogram is how a p99 ends up describing the
+    // failure mode instead of the service.
     if (e.sink == nullptr) {
       continue;
     }
@@ -199,7 +225,7 @@ io::task<void> backend_conn::driver() {
   ++live_coroutines_;
   while (!draining_) {
     // ---- connect (bounded by the watchdog via connect_slot_) ----
-    state_ = state::connecting;
+    set_state(state::connecting);
     session_was_connected_ = false;
     connect_deadline_ = std::chrono::steady_clock::now() + cfg_.connect_timeout;
     poke_watchdog();
@@ -217,7 +243,7 @@ io::task<void> backend_conn::driver() {
     }
     if (rc < 0) {
       s.reset();
-      state_ = state::down;
+      set_state(state::down);
       poke_watchdog();
       // Rate-limited: a backend that is down stays down, and the backoff caps
       // at 2 s, so an unlimited line here is one every two seconds forever.
@@ -232,7 +258,7 @@ io::task<void> backend_conn::driver() {
 
     // ---- connected session ----
     fd_ = std::move(s);
-    state_ = state::connected;
+    set_state(state::connected);
     session_was_connected_ = true;
     VKP_LOG_INFO("backend {backend}: connected", io::to_string(addr_));
     backoff_ = cfg_.backoff_base;
@@ -261,19 +287,25 @@ io::task<void> backend_conn::driver() {
   }
 
   // Drain path: same cancel-before-close discipline, then fail leftovers.
-  state_ = state::down;
+  set_state(state::down);
   while (writer_sending_) {
     (void)co_await writer_parked_.wait();
   }
   fail_all();
   out_.clear();
   fd_.reset();
+  // Leave the state gauge entirely: this connection is gone, and a retired
+  // node's connections lingering in `down` would read as an outage.
+  if (state_counted_) {
+    stats_.backend_conns(gauge_state(state_)).dec();
+    state_counted_ = false;
+  }
   --live_coroutines_;
   finished_.notify_all();
 }
 
 void backend_conn::teardown_session() noexcept {
-  state_ = state::down;
+  set_state(state::down);
   poke_watchdog();
   recv_slot_.reset();
   if (writer_sending_) {
@@ -393,6 +425,7 @@ io::task<void> backend_conn::watchdog() {
           out_.append(kHealthPing);
           inflight_.push_back(
               {.sink = nullptr, .token = 0, .deadline = fired + cfg_.request_timeout});
+          stats_.backend_inflight.inc();
           last_activity_ = fired;
           out_ready_.notify_one();
         }

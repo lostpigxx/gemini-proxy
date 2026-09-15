@@ -196,6 +196,19 @@ redirect parse_redirect(std::string_view frame) noexcept {
   return r;
 }
 
+metrics::error_kind route_error_kind(routing::status st) noexcept {
+  switch (st) {
+    case routing::status::crossslot:
+      return metrics::error_kind::crossslot;
+    case routing::status::unsupported:
+      return metrics::error_kind::unsupported;
+    case routing::status::unavailable:
+    case routing::status::ok:
+      break;
+  }
+  return metrics::error_kind::no_topology;
+}
+
 std::string route_error_reply(routing::status st, const command_info* info) {
   switch (st) {
     case routing::status::crossslot:
@@ -223,11 +236,12 @@ std::string route_error_reply(routing::status st, const command_info* info) {
 // lets cluster routing fan a client out across nodes.
 class client_conn final : public reply_sink {
  public:
-  client_conn(io::event_loop& loop, io::unique_fd fd, router& rtr, std::size_t outbuf_limit,
-              std::size_t max_redirects)
+  client_conn(io::event_loop& loop, io::unique_fd fd, router& rtr, metrics::worker_stats& stats,
+              std::size_t outbuf_limit, std::size_t max_redirects)
       : loop_(loop),
         fd_(std::move(fd)),
         router_(rtr),
+        stats_(stats),
         outbuf_limit_(outbuf_limit),
         max_redirects_(max_redirects),
         may_redirect_(rtr.may_redirect()),
@@ -289,11 +303,35 @@ class client_conn final : public reply_sink {
     std::string reply;    // only populated when the reply arrived out of order
     std::string request;  // retry copy; cluster mode only (router::may_redirect)
     std::uint32_t redirects = 0;
+    // From event_loop::now(), the clock the loop already read this iteration —
+    // so the proxy-side histogram costs no per-request syscall (design m5 §2).
+    std::chrono::steady_clock::time_point started{};
   };
+
+  // What a finished reply counts as. Only error frames are inspected, so the
+  // common path is one byte compare. Matching our canned errors by text means
+  // a backend echoing them verbatim would be misfiled — it cannot happen from
+  // a real valkey, and if it did, the classification would still be right.
+  static metrics::outcome classify(std::string_view frame) noexcept {
+    if (!frame.starts_with('-')) {
+      return metrics::outcome::ok;
+    }
+    if (frame == kErrTimeout) {
+      return metrics::outcome::timeout;
+    }
+    if (frame == kErrBackendUnavailable || frame == kErrBackendLost) {
+      return metrics::outcome::unavailable;
+    }
+    return metrics::outcome::error;
+  }
 
   // Puts `frame` in its place in the output order and flushes the contiguous
   // filled prefix.
   void fill(std::size_t index, std::string_view frame) {
+    // Counted here rather than at flush time: this is the moment the request
+    // got its answer, and it runs exactly once per slot in either order.
+    stats_.bump_response(classify(frame));
+    stats_.request_duration.observe(loop_.now() - slots_[index].started);
     if (index != 0) {
       // Out of order: park it and wait for the earlier slots.
       slots_[index].filled = true;
@@ -312,6 +350,7 @@ class client_conn final : public reply_sink {
       drained_.notify_all();
     }
     if (out_.size() > outbuf_limit_) {
+      stats_.bump_error(metrics::error_kind::outbuf_limit);
       abort_now();  // slow client: cut it loose instead of buffering forever
       return;
     }
@@ -329,6 +368,7 @@ class client_conn final : public reply_sink {
       return;
     }
     if (s.redirects >= max_redirects_) {
+      stats_.bump_error(metrics::error_kind::too_many_redirects);
       VKP_LOG_WARN_EVERY(
           1s, "redirect: giving up after {hops} hops, slot {slot} last pointed at {host}:{port}",
           max_redirects_, r.slot, r.host, r.port);
@@ -336,6 +376,7 @@ class client_conn final : public reply_sink {
       return;
     }
     ++s.redirects;
+    stats_.bump_redirect(r.moved ? metrics::redirect_kind::moved : metrics::redirect_kind::ask);
     if (r.moved) {
       // Rate-limited hard: a resharding cluster emits MOVED by the thousand,
       // and one line per redirect would bury every other event in the log.
@@ -349,6 +390,7 @@ class client_conn final : public reply_sink {
     const routing dest = router_.node_at(r.host, r.port);
     backend_conn* c = dest.get();
     if (dest.st != routing::status::ok || !c->available()) {
+      stats_.bump_error(metrics::error_kind::backend_unavailable);
       fill(index, kErrBackendUnavailable);
       return;
     }
@@ -365,7 +407,7 @@ class client_conn final : public reply_sink {
   // Takes the next token and reserves its place in the output order.
   // Invariant: next_token_ == head_token_ + slots_.size().
   std::uint64_t new_slot() {
-    slots_.emplace_back();
+    slots_.emplace_back().started = loop_.now();
     return next_token_++;
   }
 
@@ -400,22 +442,33 @@ class client_conn final : public reply_sink {
         co_return;
       }
       if (fr.k == frame_result::kind::protocol_error) {
+        stats_.bump_error(metrics::error_kind::protocol);
         reply_now(fmt::format("-ERR Protocol error: {}\r\n", resp::to_string(fr.perr)));
         co_return;
       }
       if (fr.k != frame_result::kind::frame) {
         co_return;  // eof / io error / cancelled
       }
+      // Request frame bytes, not socket bytes: pipelined batches are already
+      // covered and the number stays comparable with vkp_requests_total. A
+      // frame that never parses is counted as an error instead.
+      stats_.bump_bytes(metrics::byte_dir::in, fr.len);
 
       const resp::message_view& msg = parser.message();
       if (!msg.is_command) {
+        stats_.bump_error(metrics::error_kind::protocol);
         reply_now("-ERR Protocol error: expected a command\r\n");
         co_return;
       }
       bool close_after = false;
       const command_info* info = find_command(msg.args[0]);
+      // Unknown commands are `other`: the table is the only thing that knows
+      // read from write, and guessing from the name is how you get a SET
+      // counted as a read.
+      stats_.bump_request(info != nullptr ? info->cls : metrics::cmd_class::other);
       const cmd_policy policy = info != nullptr ? info->policy : cmd_policy::forward;
       if (policy == cmd_policy::reject) {
+        stats_.bump_error(metrics::error_kind::unsupported);
         reply_now(fmt::format("-ERR unsupported by proxy: {}\r\n", info->name));
       } else if (policy == cmd_policy::local) {
         reply_now(handle_local(msg, *info, close_after));
@@ -429,11 +482,13 @@ class client_conn final : public reply_sink {
         for (;;) {
           const routing r = router_.route(msg.args, info);
           if (r.st != routing::status::ok) {
+            stats_.bump_error(route_error_kind(r.st));
             reply_now(route_error_reply(r.st, info));
             break;
           }
           backend_conn* c = r.get();
           if (!c->available()) {
+            stats_.bump_error(metrics::error_kind::backend_unavailable);
             reply_now(kErrBackendUnavailable);
             break;
           }
@@ -489,6 +544,7 @@ class client_conn final : public reply_sink {
         abort_now();
         break;
       }
+      stats_.bump_bytes(metrics::byte_dir::out, batch.size());
     }
     writer_live_ = false;
     writer_done_.notify_all();
@@ -510,6 +566,7 @@ class client_conn final : public reply_sink {
   io::event_loop& loop_;
   io::unique_fd fd_;
   router& router_;
+  metrics::worker_stats& stats_;
   std::size_t outbuf_limit_;
   std::size_t max_redirects_;
   bool may_redirect_;  // standalone skips the per-request retry copy
@@ -548,10 +605,11 @@ router_config make_router_config(const config& cfg) {
 
 }  // namespace
 
-server::server(io::event_loop& loop, config cfg)
+server::server(io::event_loop& loop, config cfg, metrics::worker_stats& stats)
     : loop_(loop),
       cfg_(std::move(cfg)),
-      router_(loop, make_router_config(cfg_)),
+      stats_(stats),
+      router_(loop, make_router_config(cfg_), stats),
       listener_(io::listen_tcp(cfg_.listen_host, cfg_.listen_port, cfg_.backlog, cfg_.reuseport)),
       port_(io::local_port(listener_.get())) {}
 
@@ -605,11 +663,14 @@ io::task<void> server::acceptor() {
 
 io::task<void> server::connection(io::unique_fd client) {
   ++active_;
+  stats_.client_connections.set(active_);
+  stats_.client_connections_total.bump();
   // Debug level on purpose: at connection-churn rates this is the one control
   // -plane event frequent enough to cost something, so it stays off by default.
   VKP_LOG_DEBUG("client connected on port {port}, {open} open", port_, active_);
   {
-    client_conn c{loop_, std::move(client), router_, cfg_.client_outbuf_limit, cfg_.max_redirects};
+    client_conn c{loop_,  std::move(client),        router_,
+                  stats_, cfg_.client_outbuf_limit, cfg_.max_redirects};
     try {
       co_await c.run();
     } catch (const std::exception&) {
@@ -617,6 +678,7 @@ io::task<void> server::connection(io::unique_fd client) {
     }
   }
   --active_;
+  stats_.client_connections.set(active_);
   VKP_LOG_DEBUG("client disconnected on port {port}, {open} open", port_, active_);
   maybe_drain_backends();
 }

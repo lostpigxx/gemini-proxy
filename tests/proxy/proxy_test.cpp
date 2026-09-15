@@ -6,6 +6,7 @@
 #include <fmt/format.h>
 
 #include "core/buffer.hpp"
+#include "core/metrics.hpp"
 #include "io/backend.hpp"
 #include "io/event_loop.hpp"
 #include "io/socket.hpp"
@@ -19,6 +20,14 @@ namespace io = vkp::io;
 namespace proxy = vkp::proxy;
 
 namespace {
+
+// Instrumentation is a required constructor argument so that production
+// wiring cannot silently be forgotten. Cases that do not assert on metrics
+// share this block; Catch2 runs cases sequentially, so it needs no locking.
+vkp::metrics::worker_stats& scratch_stats() {
+  static vkp::metrics::worker_stats s;
+  return s;
+}
 
 constexpr std::string_view kPing = "*1\r\n$4\r\nPING\r\n";
 
@@ -162,7 +171,7 @@ TEST_CASE("proxy relays frames per backend", "[proxy]") {
       const std::uint16_t fake_port = io::local_port(fake_lst.get());
       io::spawn(fake_acceptor(loop, fake_lst.get(), {}));
 
-      proxy::server srv{loop, test_config(fake_port)};
+      proxy::server srv{loop, test_config(fake_port), scratch_stats()};
       srv.start();
       countdown cd{.n = 1, .srv = &srv};
 
@@ -198,7 +207,7 @@ TEST_CASE("interleaved pipelines from two clients keep per-client order", "[prox
   io::unique_fd fake_lst = io::listen_tcp("127.0.0.1", 0);
   io::spawn(fake_acceptor(loop, fake_lst.get(), {}));
 
-  proxy::server srv{loop, test_config(io::local_port(fake_lst.get()))};
+  proxy::server srv{loop, test_config(io::local_port(fake_lst.get())), scratch_stats()};
   srv.start();
   countdown cd{.n = 2, .srv = &srv};
 
@@ -230,7 +239,7 @@ TEST_CASE("rejected command replies stay in pipeline order", "[proxy]") {
   io::unique_fd fake_lst = io::listen_tcp("127.0.0.1", 0);
   io::spawn(fake_acceptor(loop, fake_lst.get(), {}));
 
-  proxy::server srv{loop, test_config(io::local_port(fake_lst.get()))};
+  proxy::server srv{loop, test_config(io::local_port(fake_lst.get())), scratch_stats()};
   srv.start();
   countdown cd{.n = 1, .srv = &srv};
 
@@ -251,7 +260,7 @@ TEST_CASE("connection-state commands are answered locally", "[proxy]") {
   io::unique_fd fake_lst = io::listen_tcp("127.0.0.1", 0);
   io::spawn(fake_acceptor(loop, fake_lst.get(), {}));
 
-  proxy::server srv{loop, test_config(io::local_port(fake_lst.get()))};
+  proxy::server srv{loop, test_config(io::local_port(fake_lst.get())), scratch_stats()};
   srv.start();
   countdown cd{.n = 1, .srv = &srv};
 
@@ -292,7 +301,7 @@ TEST_CASE("proxy reports an unreachable backend and keeps the client open", "[pr
   io::event_loop loop;
   const std::uint16_t dead_port = grab_free_port();
 
-  proxy::server srv{loop, test_config(dead_port)};
+  proxy::server srv{loop, test_config(dead_port), scratch_stats()};
   srv.start();
   countdown cd{.n = 1, .srv = &srv};
 
@@ -310,7 +319,7 @@ TEST_CASE("request timeout fails the request and rebuilds the connection", "[pro
 
   proxy::config cfg = test_config(io::local_port(fake_lst.get()));
   cfg.backend.request_timeout = 80ms;
-  proxy::server srv{loop, cfg};
+  proxy::server srv{loop, cfg, scratch_stats()};
   srv.start();
   countdown cd{.n = 1, .srv = &srv};
 
@@ -328,7 +337,7 @@ TEST_CASE("backend dying mid-pipeline fails the remaining requests", "[proxy]") 
   io::unique_fd fake_lst = io::listen_tcp("127.0.0.1", 0);
   io::spawn(fake_acceptor(loop, fake_lst.get(), {.m = fake_behavior::mode::first_then_close}));
 
-  proxy::server srv{loop, test_config(io::local_port(fake_lst.get()))};
+  proxy::server srv{loop, test_config(io::local_port(fake_lst.get())), scratch_stats()};
   srv.start();
   countdown cd{.n = 1, .srv = &srv};
 
@@ -344,7 +353,7 @@ TEST_CASE("proxy reconnects after the backend comes back", "[proxy]") {
   io::event_loop loop;
   const std::uint16_t port = grab_free_port();
 
-  proxy::server srv{loop, test_config(port)};  // nothing listens yet
+  proxy::server srv{loop, test_config(port), scratch_stats()};  // nothing listens yet
   srv.start();
 
   io::spawn([](io::event_loop& l, proxy::server& s, std::uint16_t backend_port) -> io::task<void> {
@@ -385,7 +394,7 @@ TEST_CASE("deep pipeline under max_inflight=1 stays correct", "[proxy]") {
 
   proxy::config cfg = test_config(io::local_port(fake_lst.get()));
   cfg.backend.max_inflight = 1;  // every request waits for the previous one
-  proxy::server srv{loop, cfg};
+  proxy::server srv{loop, cfg, scratch_stats()};
   srv.start();
   countdown cd{.n = 1, .srv = &srv};
 
@@ -409,7 +418,7 @@ TEST_CASE("locally answered replies wait behind the forwarded ones", "[proxy]") 
 
   proxy::config cfg = test_config(io::local_port(fake_lst.get()));
   cfg.backend.max_inflight = 1;  // forwarded replies trickle back one at a time
-  proxy::server srv{loop, cfg};
+  proxy::server srv{loop, cfg, scratch_stats()};
   srv.start();
   countdown cd{.n = 1, .srv = &srv};
 
@@ -438,7 +447,7 @@ TEST_CASE("idle backend connections get health-check PINGs", "[proxy]") {
 
   proxy::config cfg = test_config(io::local_port(fake_lst.get()));
   cfg.backend.health_interval = 30ms;
-  proxy::server srv{loop, cfg};
+  proxy::server srv{loop, cfg, scratch_stats()};
   srv.start();
 
   io::spawn([](io::event_loop& l, proxy::server& s) -> io::task<void> {
@@ -447,4 +456,104 @@ TEST_CASE("idle backend connections get health-check PINGs", "[proxy]") {
   }(loop, srv));
   loop.run();
   CHECK(pings >= 2);
+}
+
+// --------------------------------------------------------------- metrics
+//
+// These assert the wiring, not the counter primitives (core/metrics_test.cpp
+// covers those): that a request travelling the real path lands in the right
+// series, with its own stats block so the numbers are exact and not a running
+// total from whatever case ran before.
+
+TEST_CASE("metrics count what actually went through the proxy", "[proxy][metrics]") {
+  vkp::metrics::worker_stats stats;
+  io::event_loop loop;
+  io::unique_fd fake_lst = io::listen_tcp("127.0.0.1", 0);
+  io::spawn(fake_acceptor(loop, fake_lst.get(), {}));
+
+  proxy::server srv{loop, test_config(io::local_port(fake_lst.get())), stats};
+  srv.start();
+  countdown cd{.n = 1, .srv = &srv};
+
+  // Two reads, one write, and one command the proxy refuses outright.
+  const std::string payload =
+      "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"
+      "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"
+      "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"
+      "*1\r\n$5\r\nMULTI\r\n";
+  const std::string expect =
+      echo_reply("k") + echo_reply("k") + echo_reply("k") + "-ERR unsupported by proxy: MULTI\r\n";
+  std::string out;
+  io::spawn(
+      client_script(loop, srv.port(), payload, expect.size(), false, out, [&cd] { cd.done(); }));
+  loop.run();
+  REQUIRE(out == expect);
+
+  using vkp::metrics::byte_dir;
+  using vkp::metrics::cmd_class;
+  using vkp::metrics::error_kind;
+  using vkp::metrics::outcome;
+  CHECK(stats.requests[static_cast<std::size_t>(cmd_class::read)].read() == 2);
+  CHECK(stats.requests[static_cast<std::size_t>(cmd_class::write)].read() == 1);
+  // A rejected command is `other`, not the write it would have been.
+  CHECK(stats.requests[static_cast<std::size_t>(cmd_class::other)].read() == 1);
+  CHECK(stats.responses[static_cast<std::size_t>(outcome::ok)].read() == 3);
+  CHECK(stats.responses[static_cast<std::size_t>(outcome::error)].read() == 1);
+  CHECK(stats.errors[static_cast<std::size_t>(error_kind::unsupported)].read() == 1);
+
+  // Every request filled exactly one slot; only the three forwarded ones got
+  // a backend sample.
+  CHECK(stats.request_duration.count() == 4);
+  CHECK(stats.backend_duration.count() == 3);
+
+  CHECK(stats.client_bytes[static_cast<std::size_t>(byte_dir::in)].read() == payload.size());
+  CHECK(stats.client_bytes[static_cast<std::size_t>(byte_dir::out)].read() == expect.size());
+  CHECK(stats.client_connections_total.read() == 1);
+  CHECK(stats.client_connections.read() == 0);  // the gauge came back down
+}
+
+TEST_CASE("an unreachable backend shows up as unavailable, not as an error", "[proxy][metrics]") {
+  vkp::metrics::worker_stats stats;
+  io::event_loop loop;
+
+  proxy::server srv{loop, test_config(grab_free_port()), stats};
+  srv.start();
+  countdown cd{.n = 1, .srv = &srv};
+
+  std::string out;
+  io::spawn(client_script(loop, srv.port(), std::string{kPing},
+                          proxy::kErrBackendUnavailable.size(), false, out, [&cd] { cd.done(); }));
+  loop.run();
+  REQUIRE(out == proxy::kErrBackendUnavailable);
+
+  using vkp::metrics::error_kind;
+  using vkp::metrics::outcome;
+  CHECK(stats.errors[static_cast<std::size_t>(error_kind::backend_unavailable)].read() == 1);
+  CHECK(stats.responses[static_cast<std::size_t>(outcome::unavailable)].read() == 1);
+  CHECK(stats.responses[static_cast<std::size_t>(outcome::ok)].read() == 0);
+  CHECK(stats.backend_duration.count() == 0);  // nothing ever reached a backend
+  // The connection never came up, and once the driver unwound it left the
+  // gauge instead of sitting in `down` forever.
+  CHECK(
+      stats.backend_connections[static_cast<std::size_t>(vkp::metrics::conn_state::down)].read() ==
+      0);
+}
+
+TEST_CASE("a malformed request frame counts as a protocol error", "[proxy][metrics]") {
+  vkp::metrics::worker_stats stats;
+  io::event_loop loop;
+  io::unique_fd fake_lst = io::listen_tcp("127.0.0.1", 0);
+  io::spawn(fake_acceptor(loop, fake_lst.get(), {}));
+
+  proxy::server srv{loop, test_config(io::local_port(fake_lst.get())), stats};
+  srv.start();
+  countdown cd{.n = 1, .srv = &srv};
+
+  std::string out;
+  io::spawn(
+      client_script(loop, srv.port(), "*1\r\n$4\r\nPING\r\r", 0, true, out, [&cd] { cd.done(); }));
+  loop.run();
+  CHECK(out.starts_with("-ERR Protocol error:"));
+  CHECK(stats.errors[static_cast<std::size_t>(vkp::metrics::error_kind::protocol)].read() == 1);
+  CHECK(stats.requests[static_cast<std::size_t>(vkp::metrics::cmd_class::read)].read() == 0);
 }

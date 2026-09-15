@@ -14,6 +14,7 @@
 
 #include "cluster/slot.hpp"
 #include "core/buffer.hpp"
+#include "core/metrics.hpp"
 #include "io/event_loop.hpp"
 #include "io/socket.hpp"
 #include "io/task.hpp"
@@ -27,6 +28,14 @@ namespace proxy = vkp::proxy;
 namespace cluster = vkp::cluster;
 
 namespace {
+
+// Instrumentation is a required constructor argument so that production
+// wiring cannot silently be forgotten. Cases that do not assert on metrics
+// share this block; Catch2 runs cases sequentially, so it needs no locking.
+vkp::metrics::worker_stats& scratch_stats() {
+  static vkp::metrics::worker_stats s;
+  return s;
+}
 
 // A stand-in cluster node.
 //
@@ -248,7 +257,7 @@ TEST_CASE("MOVED is retried on the new node and updates the topology", "[cluster
   n0.start();
   n1.start();
 
-  proxy::server srv{loop, cluster_config(n0.port)};
+  proxy::server srv{loop, cluster_config(n0.port), scratch_stats()};
   srv.start();
 
   // Two GETs of the same key: the first eats the MOVED, the second must go
@@ -275,7 +284,7 @@ TEST_CASE("ASK sends ASKING first and leaves the topology alone", "[cluster][red
   n0.start();
   n1.start();
 
-  proxy::server srv{loop, cluster_config(n0.port)};
+  proxy::server srv{loop, cluster_config(n0.port), scratch_stats()};
   srv.start();
 
   std::string out;
@@ -309,7 +318,7 @@ TEST_CASE("a redirect loop is capped instead of spinning forever", "[cluster][re
 
   proxy::config cfg = cluster_config(n0.port);
   cfg.max_redirects = 3;
-  proxy::server srv{loop, cfg};
+  proxy::server srv{loop, cfg, scratch_stats()};
   srv.start();
 
   std::string out;
@@ -337,7 +346,7 @@ TEST_CASE("standalone passes a redirect through instead of chasing it", "[cluste
   cfg.listen_port = 0;
   cfg.backend_port = backend.port;
   cfg.shutdown_grace = 1s;
-  proxy::server srv{loop, cfg};
+  proxy::server srv{loop, cfg, scratch_stats()};
   srv.start();
 
   std::string out;
@@ -360,7 +369,7 @@ TEST_CASE("keys reach the node that owns their slot", "[cluster][routing]") {
   n0.start();
   n1.start();
 
-  proxy::server srv{loop, cluster_config(n0.port)};
+  proxy::server srv{loop, cluster_config(n0.port), scratch_stats()};
   srv.start();
 
   const std::string low = key_in(0, 8191);
@@ -385,7 +394,7 @@ TEST_CASE("a multi-key command must stay inside one slot", "[cluster][routing]")
   n0.start();
   n1.start();
 
-  proxy::server srv{loop, cluster_config(n0.port)};
+  proxy::server srv{loop, cluster_config(n0.port), scratch_stats()};
   srv.start();
 
   // A hash tag forces both keys into one slot; without it they scatter.
@@ -417,7 +426,7 @@ TEST_CASE("a slow node does not reorder the client's replies", "[cluster][routin
   slow.start();
   fast.start();
 
-  proxy::server srv{loop, cluster_config(slow.port)};
+  proxy::server srv{loop, cluster_config(slow.port), scratch_stats()};
   srv.start();
 
   // Pipelined in one write, so both are in flight at once: the second reply
@@ -438,7 +447,7 @@ TEST_CASE("cluster mode refuses what it cannot route", "[cluster][routing]") {
   n0.shards = shards_frame({{0, 16383, n0.port}});
   n0.start();
 
-  proxy::server srv{loop, cluster_config(n0.port)};
+  proxy::server srv{loop, cluster_config(n0.port), scratch_stats()};
   srv.start();
 
   // CLUSTER is refused outright (the proxy always looks standalone); SCAN and
@@ -472,7 +481,7 @@ TEST_CASE("a refresh moves traffic off a node that left the topology", "[cluster
 
   proxy::config cfg = cluster_config(n0.port);
   cfg.cluster_refresh = 20ms;
-  proxy::server srv{loop, cfg};
+  proxy::server srv{loop, cfg, scratch_stats()};
   srv.start();
 
   const std::string high = key_in(8192, 16383);

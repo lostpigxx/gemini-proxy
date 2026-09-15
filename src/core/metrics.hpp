@@ -179,6 +179,9 @@ class alignas(64) worker_stats {
   void bump_refresh(refresh_result r) noexcept {
     topology_refresh[static_cast<std::size_t>(r)].bump();
   }
+  [[nodiscard]] gauge& backend_conns(conn_state s) noexcept {
+    return backend_connections[static_cast<std::size_t>(s)];
+  }
 
   // The /topology snapshot. Each worker refreshes its own topology (m4 §4.2),
   // so the admin thread cannot read the live structure; the worker pre-renders

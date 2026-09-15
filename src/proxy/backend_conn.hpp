@@ -10,6 +10,7 @@
 
 #include "core/buffer.hpp"
 #include "core/byte_queue.hpp"
+#include "core/metrics.hpp"
 #include "io/event_loop.hpp"
 #include "io/socket.hpp"
 #include "io/task.hpp"
@@ -68,7 +69,8 @@ struct frame_result {
 // start() → (begin_drain() → finished()) → destroy after the loop ran dry.
 class backend_conn {
  public:
-  backend_conn(io::event_loop& loop, const io::resolved_addr& addr, const backend_conn_config& cfg);
+  backend_conn(io::event_loop& loop, const io::resolved_addr& addr, const backend_conn_config& cfg,
+               metrics::worker_stats& stats);
 
   backend_conn(const backend_conn&) = delete;
   backend_conn& operator=(const backend_conn&) = delete;
@@ -134,6 +136,23 @@ class backend_conn {
 
   io::task<void> read_responses();  // one connected session; returns on error/kill
   io::task<bool> backoff_wait();    // false: drain/stop, exit the driver loop
+  // The sole writer of state_: keeps vkp_backend_connections{state} in step
+  // with it, so the gauge cannot drift from reality by someone forgetting.
+  void set_state(state s) noexcept;
+  // Spelled out rather than cast: the two enumerations happen to run in
+  // opposite order, and a cast would silently report every connection as the
+  // state it is not.
+  [[nodiscard]] static constexpr metrics::conn_state gauge_state(state s) noexcept {
+    switch (s) {
+      case state::connected:
+        return metrics::conn_state::connected;
+      case state::connecting:
+        return metrics::conn_state::connecting;
+      case state::down:
+        break;
+    }
+    return metrics::conn_state::down;
+  }
   void teardown_session() noexcept;
   void push(reply_sink* sink, std::uint64_t token, std::string_view frame);
   void deliver_head(std::string_view frame);
@@ -143,9 +162,13 @@ class backend_conn {
   io::event_loop& loop_;
   const io::resolved_addr& addr_;
   backend_conn_config cfg_;
+  metrics::worker_stats& stats_;
 
   io::unique_fd fd_;
   state state_ = state::down;
+  // False before start() and after the driver unwound: a retired connection
+  // must leave the state gauge, not sit in `down` forever.
+  bool state_counted_ = false;
   bool draining_ = false;
   bool session_was_connected_ = false;  // unavailable vs lost error wording
   bool head_timed_out_ = false;

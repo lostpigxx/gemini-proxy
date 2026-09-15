@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "core/metrics.hpp"
 #include "io/event_loop.hpp"
 #include "io/socket.hpp"
 #include "io/task.hpp"
@@ -43,7 +44,7 @@ class server {
  public:
   // Resolves the backend address and binds the listener immediately (throws
   // std::system_error / std::runtime_error); coroutines start on start().
-  server(io::event_loop& loop, config cfg);
+  server(io::event_loop& loop, config cfg, metrics::worker_stats& stats);
 
   server(const server&) = delete;
   server& operator=(const server&) = delete;
@@ -69,6 +70,7 @@ class server {
 
   io::event_loop& loop_;
   config cfg_;
+  metrics::worker_stats& stats_;
   router router_;
   io::unique_fd listener_;
   std::uint16_t port_ = 0;

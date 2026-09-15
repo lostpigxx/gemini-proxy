@@ -79,11 +79,13 @@ void pin_threads([[maybe_unused]] bool enabled,
 
 }  // namespace
 
-worker_pool::worker_pool(options opt) : cpu_affinity_(opt.cpu_affinity) {
-  std::size_t n = opt.workers;
-  if (n == 0) {
-    n = std::max(1U, std::thread::hardware_concurrency());
-  }
+std::size_t worker_pool::resolve_workers(std::size_t requested) noexcept {
+  return requested != 0 ? requested : std::max(1U, std::thread::hardware_concurrency());
+}
+
+worker_pool::worker_pool(options opt)
+    : stats_(resolve_workers(opt.workers)), cpu_affinity_(opt.cpu_affinity) {
+  const std::size_t n = stats_.workers();
   config cfg = std::move(opt.cfg);
   cfg.reuseport = n > 1;
 
@@ -92,7 +94,7 @@ worker_pool::worker_pool(options opt) : cpu_affinity_(opt.cpu_affinity) {
     auto w = std::make_unique<worker>();
     w->loop = std::make_unique<io::event_loop>(opt.io_backend ? io::make_backend(*opt.io_backend)
                                                               : io::make_backend());
-    w->srv = std::make_unique<server>(*w->loop, cfg);
+    w->srv = std::make_unique<server>(*w->loop, cfg, stats_.worker(i));
     if (i == 0) {
       cfg.listen_port = w->srv->port();  // ephemeral bind: the rest join it
     }

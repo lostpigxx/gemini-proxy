@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "cluster/topology.hpp"
+#include "core/metrics.hpp"
 #include "io/event_loop.hpp"
 #include "io/socket.hpp"
 #include "io/task.hpp"
@@ -73,7 +74,7 @@ class router {
  public:
   // Resolves addresses and builds the pool (throws std::runtime_error /
   // std::system_error); coroutines and connecting start on start().
-  router(io::event_loop& loop, router_config cfg);
+  router(io::event_loop& loop, router_config cfg, metrics::worker_stats& stats);
   ~router();
 
   router(const router&) = delete;
@@ -147,6 +148,10 @@ class router {
   node_conns* try_ensure_node(std::string_view host, std::uint16_t port) noexcept;
   void adopt(cluster::topology t);
   void retire_unreferenced();
+  // Pre-renders the slot map into this worker's stats block for /topology.
+  // Done by the worker because the topology is per-worker and the admin
+  // thread cannot read the live structure (design m5 §5).
+  void publish_topology();
 
   io::task<void> refresher();
   io::task<void> reaper();
@@ -159,6 +164,7 @@ class router {
 
   io::event_loop& loop_;
   router_config cfg_;
+  metrics::worker_stats& stats_;
   std::vector<endpoint> seeds_;
   bool cluster_ = false;
   bool started_ = false;
