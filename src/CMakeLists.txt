@@ -3,6 +3,7 @@ add_library(vkp_lib STATIC
   admin/http_parse.cpp
   admin/http_server.cpp
   cluster/topology.cpp
+  config/settings.cpp
   core/buffer.cpp
   core/log.cpp
   core/metrics.cpp
@@ -28,7 +29,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 target_include_directories(vkp_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # quill is PUBLIC: core/log.hpp expands quill's macros in every TU that logs.
-target_link_libraries(vkp_lib PRIVATE vkp_options PUBLIC fmt::fmt quill::quill)
+target_link_libraries(vkp_lib
+  PRIVATE vkp_options tomlplusplus::tomlplusplus
+  PUBLIC fmt::fmt quill::quill
+)
 
 add_executable(proxyd main.cpp)
 target_link_libraries(proxyd

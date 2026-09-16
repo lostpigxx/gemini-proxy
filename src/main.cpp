@@ -11,6 +11,7 @@
 #include <fmt/ranges.h>
 
 #include "admin/http_server.hpp"
+#include "config/settings.hpp"
 #include "core/log.hpp"
 #include "core/version.hpp"
 #include "io/backend.hpp"
@@ -31,32 +32,16 @@ extern "C" void on_signal(int /*signo*/) {
   }
 }
 
-// "host:port" (host may be empty for 0.0.0.0); IPv6 literals use [addr]:port.
-std::pair<std::string, std::uint16_t> parse_endpoint(const std::string& ep) {
-  const std::size_t colon = ep.rfind(':');
-  if (colon == std::string::npos) {
-    throw std::runtime_error(fmt::format("invalid endpoint '{}': expected host:port", ep));
-  }
-  std::string host = ep.substr(0, colon);
-  if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
-    host = host.substr(1, host.size() - 2);
-  }
-  if (host.empty()) {
-    host = "0.0.0.0";
-  }
-  const int port = std::stoi(ep.substr(colon + 1));
-  if (port < 0 || port > 65535) {
-    throw std::runtime_error(fmt::format("invalid port in '{}'", ep));
-  }
-  return {host, static_cast<std::uint16_t>(port)};
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
   CLI::App app{fmt::format("valkey-proxy {}", vkp::kVersion)};
   app.set_version_flag("--version", std::string{vkp::kVersion});
 
+  // These hold what the command line said; whether they are used at all is
+  // decided after the file is read, by Option::count(). The defaults below are
+  // only what --help prints — vkp::config::settings owns the real ones.
+  std::string config_path;
   std::string listen_ep = "127.0.0.1:6380";
   std::string backend_ep = "127.0.0.1:6379";
   std::string io_backend = "auto";
@@ -67,83 +52,150 @@ int main(int argc, char** argv) {
   std::vector<std::string> cluster_seeds;
   std::uint32_t cluster_refresh_ms = 5000;
   std::size_t max_redirects = 5;
-  app.add_option("-l,--listen", listen_ep, "Listen endpoint (host:port)")->capture_default_str();
-  auto* backend_opt =
+  std::string log_level = "info";
+  std::string log_format = "text";
+  std::string log_file;
+  std::string admin_ep = "127.0.0.1:9180";
+  std::uint32_t shutdown_grace_ms = 5000;
+
+  app.add_option("-c,--config", config_path, "TOML configuration file")->check(CLI::ExistingFile);
+  auto* o_listen = app.add_option("-l,--listen", listen_ep, "Listen endpoint (host:port)")
+                       ->capture_default_str();
+  auto* o_backend =
       app.add_option("-b,--backend", backend_ep, "Backend valkey endpoint (host:port)")
           ->capture_default_str();
-  app.add_option("--cluster-seeds", cluster_seeds,
-                 "Comma-separated cluster seed endpoints; enables cluster mode")
-      ->delimiter(',')
-      ->excludes(backend_opt);
-  app.add_option("--cluster-refresh-ms", cluster_refresh_ms, "Topology refresh interval")
-      ->capture_default_str();
-  app.add_option("--max-redirects", max_redirects, "MOVED/ASK redirects allowed per request")
-      ->check(CLI::Range(1, 64))
-      ->capture_default_str();
-  app.add_option("--io-backend", io_backend, "IO backend")
-      ->check(CLI::IsMember({"auto", "io_uring", "epoll", "kqueue"}))
-      ->capture_default_str();
-  app.add_option("-w,--workers", workers, "Worker threads (0 = one per hardware thread)")
-      ->capture_default_str();
-  app.add_flag("--cpu-affinity", cpu_affinity, "Pin workers to CPUs (Linux only)");
-  app.add_option("--conns-per-backend", conns_per_backend,
-                 "Backend connections per worker (1-2 recommended)")
-      ->check(CLI::Range(1, 8))
-      ->capture_default_str();
-  app.add_option("--request-timeout-ms", request_timeout_ms,
-                 "Per-request timeout, enqueue to response")
-      ->capture_default_str();
-
-  vkp::log::options log_opt;
-  std::string log_format = "text";
-  app.add_option("--log-level", log_opt.level, "Log level")
-      ->check(CLI::IsMember({"tracel3", "tracel2", "tracel1", "debug", "info", "warning", "error",
-                             "critical", "none"}))
-      ->capture_default_str();
-  app.add_option("--log-format", log_format, "Log output format")
-      ->check(CLI::IsMember({"text", "json"}))
-      ->capture_default_str();
-  app.add_option("--log-file", log_opt.file, "Log to this file instead of stdout");
-
-  std::string admin_ep = "127.0.0.1:9180";
-  app.add_option("--admin-listen", admin_ep,
-                 "Admin HTTP endpoint (/metrics, /health, /topology); empty disables it")
-      ->capture_default_str();
+  auto* o_seeds = app.add_option("--cluster-seeds", cluster_seeds,
+                                 "Comma-separated cluster seed endpoints; enables cluster mode")
+                      ->delimiter(',')
+                      ->excludes(o_backend);
+  auto* o_refresh =
+      app.add_option("--cluster-refresh-ms", cluster_refresh_ms, "Topology refresh interval")
+          ->capture_default_str();
+  auto* o_redirects =
+      app.add_option("--max-redirects", max_redirects, "MOVED/ASK redirects allowed per request")
+          ->check(CLI::Range(1, 64))
+          ->capture_default_str();
+  auto* o_io = app.add_option("--io-backend", io_backend, "IO backend")
+                   ->check(CLI::IsMember({"auto", "io_uring", "epoll", "kqueue"}))
+                   ->capture_default_str();
+  auto* o_workers =
+      app.add_option("-w,--workers", workers, "Worker threads (0 = one per hardware thread)")
+          ->capture_default_str();
+  auto* o_affinity =
+      app.add_flag("--cpu-affinity", cpu_affinity, "Pin workers to CPUs (Linux only)");
+  auto* o_conns = app.add_option("--conns-per-backend", conns_per_backend,
+                                 "Backend connections per worker (1-2 recommended)")
+                      ->check(CLI::Range(1, 8))
+                      ->capture_default_str();
+  auto* o_timeout = app.add_option("--request-timeout-ms", request_timeout_ms,
+                                   "Per-request timeout, enqueue to response")
+                        ->capture_default_str();
+  auto* o_level = app.add_option("--log-level", log_level, "Log level")
+                      ->check(CLI::IsMember({"tracel3", "tracel2", "tracel1", "debug", "info",
+                                             "warning", "error", "critical", "none"}))
+                      ->capture_default_str();
+  auto* o_logfmt = app.add_option("--log-format", log_format, "Log output format")
+                       ->check(CLI::IsMember({"text", "json"}))
+                       ->capture_default_str();
+  auto* o_logfile = app.add_option("--log-file", log_file, "Log to this file instead of stdout");
+  auto* o_admin =
+      app.add_option("--admin-listen", admin_ep,
+                     "Admin HTTP endpoint (/metrics, /health, /topology); empty disables it")
+          ->capture_default_str();
+  auto* o_grace = app.add_option("--shutdown-grace-ms", shutdown_grace_ms,
+                                 "Hard stop this long after SIGTERM, even with requests in flight")
+                      ->capture_default_str();
 
   CLI11_PARSE(app, argc, argv);
 
-  log_opt.fmt = log_format == "json" ? vkp::log::format::json : vkp::log::format::text;
+  vkp::config::settings cfg;
   try {
-    vkp::log::init(log_opt);
+    // Precedence: defaults → TOML → explicit command line. "Explicit" is
+    // count() > 0 rather than "differs from the default", because the latter
+    // cannot tell "not given" from "given a value equal to the default" — and
+    // the whole point of the file is to move the effective default.
+    if (!config_path.empty()) {
+      cfg = vkp::config::load_toml(config_path);
+    }
+    const auto given = [](const CLI::Option* o) { return o->count() > 0; };
+    if (given(o_listen)) {
+      std::tie(cfg.proxy.listen_host, cfg.proxy.listen_port) =
+          vkp::config::parse_endpoint(listen_ep);
+    }
+    if (given(o_backend)) {
+      std::tie(cfg.proxy.backend_host, cfg.proxy.backend_port) =
+          vkp::config::parse_endpoint(backend_ep);
+    }
+    if (given(o_seeds)) {
+      cfg.proxy.cluster_seeds = cluster_seeds;
+    }
+    if (given(o_refresh)) {
+      cfg.proxy.cluster_refresh = std::chrono::milliseconds{cluster_refresh_ms};
+    }
+    if (given(o_redirects)) {
+      cfg.proxy.max_redirects = max_redirects;
+    }
+    if (given(o_io)) {
+      cfg.io_backend = io_backend;
+    }
+    if (given(o_workers)) {
+      cfg.workers = workers;
+    }
+    if (given(o_affinity)) {
+      cfg.cpu_affinity = cpu_affinity;
+    }
+    if (given(o_conns)) {
+      cfg.proxy.conns_per_backend = conns_per_backend;
+    }
+    if (given(o_timeout)) {
+      cfg.proxy.backend.request_timeout = std::chrono::milliseconds{request_timeout_ms};
+    }
+    if (given(o_level)) {
+      cfg.log.level = log_level;
+    }
+    if (given(o_logfmt)) {
+      cfg.log_format = log_format;
+    }
+    if (given(o_logfile)) {
+      cfg.log.file = log_file;
+    }
+    if (given(o_admin)) {
+      cfg.admin_endpoint = admin_ep;
+    }
+    if (given(o_grace)) {
+      cfg.proxy.shutdown_grace = std::chrono::milliseconds{shutdown_grace_ms};
+    }
+    vkp::config::validate(cfg);
   } catch (const std::exception& e) {
-    // No logger yet, so this one genuinely has to go to stderr.
+    // No logger yet — this one genuinely has to go to stderr.
+    fmt::print(stderr, "fatal: {}\n", e.what());
+    return EXIT_FAILURE;
+  }
+
+  cfg.log.fmt = cfg.log_format == "json" ? vkp::log::format::json : vkp::log::format::text;
+  try {
+    vkp::log::init(cfg.log);
+  } catch (const std::exception& e) {
     fmt::print(stderr, "fatal: {}\n", e.what());
     return EXIT_FAILURE;
   }
 
   try {
     vkp::proxy::worker_pool::options opt;
-    std::tie(opt.cfg.listen_host, opt.cfg.listen_port) = parse_endpoint(listen_ep);
-    std::tie(opt.cfg.backend_host, opt.cfg.backend_port) = parse_endpoint(backend_ep);
-    // Reject a malformed seed here rather than at the first bootstrap attempt,
-    // where it would look like an unreachable node.
-    for (const std::string& seed : cluster_seeds) {
-      (void)parse_endpoint(seed);
-    }
-    opt.cfg.cluster_seeds = cluster_seeds;
-    opt.cfg.cluster_refresh = std::chrono::milliseconds{cluster_refresh_ms};
-    opt.cfg.max_redirects = max_redirects;
-    opt.cfg.conns_per_backend = conns_per_backend;
-    opt.cfg.backend.request_timeout = std::chrono::milliseconds{request_timeout_ms};
-    opt.workers = workers;
-    opt.cpu_affinity = cpu_affinity;
-    if (io_backend == "io_uring") {
+    opt.cfg = cfg.proxy;
+    opt.workers = cfg.workers;
+    opt.cpu_affinity = cfg.cpu_affinity;
+    if (cfg.io_backend == "io_uring") {
       opt.io_backend = vkp::io::backend_kind::io_uring;
-    } else if (io_backend == "epoll") {
+    } else if (cfg.io_backend == "epoll") {
       opt.io_backend = vkp::io::backend_kind::epoll;
-    } else if (io_backend == "kqueue") {
+    } else if (cfg.io_backend == "kqueue") {
       opt.io_backend = vkp::io::backend_kind::kqueue;
     }
+
+    // Logged before anything binds, so a postmortem's first question — "did
+    // the config take effect?" — is answered without guessing.
+    VKP_LOG_INFO("effective configuration:\n{config}", vkp::config::to_string(cfg));
 
     vkp::proxy::worker_pool pool{opt};
 
@@ -152,9 +204,10 @@ int main(int argc, char** argv) {
     // stops. Constructed after the pool so a port clash on the data plane
     // fails first.
     std::unique_ptr<vkp::admin::http_server> admin;
-    if (!admin_ep.empty()) {
+    if (!cfg.admin_endpoint.empty()) {
       vkp::admin::http_config acfg;
-      std::tie(acfg.listen_host, acfg.listen_port) = parse_endpoint(admin_ep);
+      std::tie(acfg.listen_host, acfg.listen_port) =
+          vkp::config::parse_endpoint(cfg.admin_endpoint);
       admin = std::make_unique<vkp::admin::http_server>(acfg, pool.stats());
     }
 
@@ -176,14 +229,14 @@ int main(int argc, char** argv) {
     }
 
     const std::string upstream =
-        cluster_seeds.empty()
-            ? fmt::format("backend {}:{}", opt.cfg.backend_host, opt.cfg.backend_port)
-            : fmt::format("cluster seeds {}", fmt::join(cluster_seeds, ","));
+        cfg.proxy.cluster_seeds.empty()
+            ? fmt::format("backend {}:{}", cfg.proxy.backend_host, cfg.proxy.backend_port)
+            : fmt::format("cluster seeds {}", fmt::join(cfg.proxy.cluster_seeds, ","));
     VKP_LOG_INFO(
         "valkey-proxy {version} listening on {host}:{port} -> {upstream} "
         "({workers} worker(s), {conns_per_backend} conn(s)/backend, io: {io_backend})",
-        vkp::kVersion, opt.cfg.listen_host, pool.port(), upstream, pool.workers(),
-        conns_per_backend, pool.io_backend_name());
+        vkp::kVersion, cfg.proxy.listen_host, pool.port(), upstream, pool.workers(),
+        cfg.proxy.conns_per_backend, pool.io_backend_name());
 
     pool.run();
 

@@ -4,6 +4,7 @@ add_executable(vkp_tests
   admin/http_server_test.cpp
   cluster/slot_test.cpp
   cluster/topology_test.cpp
+  config/settings_test.cpp
   core/smoke_test.cpp
   core/buffer_test.cpp
   core/byte_queue_test.cpp

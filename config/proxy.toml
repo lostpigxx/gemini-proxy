@@ -1,0 +1,66 @@
+# valkey-proxy 配置示例。每一项都是默认值，可以整段删掉——缺省的键保持默认。
+#
+#   proxyd --config config/proxy.toml
+#
+# 优先级：默认值 → 本文件 → 命令行显式给出的选项。未知的键是错误而不是警告
+# （拼错的键被静默忽略，是那种只在生产出问题时才暴露的 bug）。
+
+[listen]
+# 客户端连接的监听地址。host 留空表示 0.0.0.0；IPv6 字面量写成 "[::1]:6380"。
+# 端口 0 表示由内核挑一个（测试用）。
+endpoint = "127.0.0.1:6380"
+backlog = 1024
+
+[backend]
+# 单机模式的后端。设了 [cluster].seeds 时本项不生效。
+endpoint = "127.0.0.1:6379"
+# 每 worker 到每个后端节点的连接数。pipelining 下 1~2 就够，更多只会打散写合并。
+conns_per_worker = 1
+connect_timeout_ms = 1000
+# 从入队到收到响应的整体超时。
+request_timeout_ms = 1000
+# 空闲连接的 PING 间隔。
+health_interval_ms = 5000
+# 重连退避：base 起步，每次翻倍，封顶 max。
+backoff_base_ms = 50
+backoff_max_ms = 2000
+
+[cluster]
+# 非空即切换到 cluster 模式，此时 [backend].endpoint 不再使用。
+seeds = []
+refresh_ms = 5000
+# 单个请求允许的 MOVED/ASK 跳数。超出返回 -ERR。
+max_redirects = 5
+
+[worker]
+# 0 = 每个硬件线程一个。多 worker 时自动启用 SO_REUSEPORT，各自绑自己的 listener。
+threads = 1
+# 仅 Linux 生效，其它平台忽略。
+cpu_affinity = false
+# auto | io_uring | epoll | kqueue。auto 会探测：Linux 优先 io_uring，回落 epoll。
+io_backend = "auto"
+
+[limits]
+# 每条后端连接的在途请求数上限（背压）。
+max_inflight = 1024
+# 每条后端连接缓冲的请求字节上限（背压）。
+backend_outbuf_bytes = 1048576
+# 客户端出向缓冲的水位，超过即断开——慢客户端不该拖垮整个 worker。
+client_outbuf_bytes = 8388608
+
+[log]
+# tracel3 | tracel2 | tracel1 | debug | info | warning | error | critical | none
+level = "info"
+# text 给人看；json 每行一个对象，占位符各自成字段，给 log shipper 用。
+format = "text"
+# 留空 = stdout。
+file = ""
+
+[admin]
+# /metrics、/health、/topology。留空则完全不启动管理端口。
+# 默认只绑回环：这个口暴露拓扑与全部指标，不该直接朝外。
+endpoint = "127.0.0.1:9180"
+
+[shutdown]
+# 收到 SIGTERM 后的兜底硬停时限；在此之前会先停 accept 并等在途请求跑完。
+grace_ms = 5000
