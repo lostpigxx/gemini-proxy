@@ -1,5 +1,7 @@
 # Core library: everything except main(), shared by proxyd/tests/benchmarks/fuzzers.
 add_library(vkp_lib STATIC
+  admin/http_parse.cpp
+  admin/http_server.cpp
   cluster/topology.cpp
   core/buffer.cpp
   core/log.cpp

@@ -15,3 +15,12 @@ target_include_directories(resp_parser_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(resp_parser_fuzz PRIVATE -fsanitize=fuzzer)
 target_link_options(resp_parser_fuzz PRIVATE -fsanitize=fuzzer)
 target_link_libraries(resp_parser_fuzz PRIVATE vkp_options)
+
+add_executable(admin_http_fuzz
+  admin_http_fuzz.cpp
+  ${CMAKE_SOURCE_DIR}/src/admin/http_parse.cpp
+)
+target_include_directories(admin_http_fuzz PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(admin_http_fuzz PRIVATE -fsanitize=fuzzer)
+target_link_options(admin_http_fuzz PRIVATE -fsanitize=fuzzer)
+target_link_libraries(admin_http_fuzz PRIVATE vkp_options)

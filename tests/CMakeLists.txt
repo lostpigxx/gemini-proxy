@@ -1,6 +1,7 @@
 include(Catch)
 
 add_executable(vkp_tests
+  admin/http_server_test.cpp
   cluster/slot_test.cpp
   cluster/topology_test.cpp
   core/smoke_test.cpp

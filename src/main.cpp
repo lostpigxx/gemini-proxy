@@ -1,5 +1,6 @@
 #include <csignal>
 #include <cstdlib>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -9,6 +10,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
+#include "admin/http_server.hpp"
 #include "core/log.hpp"
 #include "core/version.hpp"
 #include "io/backend.hpp"
@@ -103,6 +105,11 @@ int main(int argc, char** argv) {
       ->capture_default_str();
   app.add_option("--log-file", log_opt.file, "Log to this file instead of stdout");
 
+  std::string admin_ep = "127.0.0.1:9180";
+  app.add_option("--admin-listen", admin_ep,
+                 "Admin HTTP endpoint (/metrics, /health, /topology); empty disables it")
+      ->capture_default_str();
+
   CLI11_PARSE(app, argc, argv);
 
   log_opt.fmt = log_format == "json" ? vkp::log::format::json : vkp::log::format::text;
@@ -140,15 +147,33 @@ int main(int argc, char** argv) {
 
     vkp::proxy::worker_pool pool{opt};
 
+    // Same self-pipe protocol as the workers, so the handler stays a pure
+    // write() fan-out: byte one drains (admin starts answering 503), byte two
+    // stops. Constructed after the pool so a port clash on the data plane
+    // fails first.
+    std::unique_ptr<vkp::admin::http_server> admin;
+    if (!admin_ep.empty()) {
+      vkp::admin::http_config acfg;
+      std::tie(acfg.listen_host, acfg.listen_port) = parse_endpoint(admin_ep);
+      admin = std::make_unique<vkp::admin::http_server>(acfg, pool.stats());
+    }
+
     // Signal plumbing before run(): SIGTERM/SIGINT drain, repeat forces.
     (void)std::signal(SIGPIPE, SIG_IGN);
     const auto& fds = pool.shutdown_fds();
-    g_signal_fd_count = static_cast<int>(std::min<std::size_t>(fds.size(), kMaxWorkers));
+    g_signal_fd_count = static_cast<int>(std::min<std::size_t>(fds.size(), kMaxWorkers - 1));
     for (int i = 0; i < g_signal_fd_count; ++i) {
       g_signal_fds[i] = fds[static_cast<std::size_t>(i)];
     }
+    if (admin) {
+      g_signal_fds[g_signal_fd_count++] = admin->shutdown_fd();
+    }
     (void)std::signal(SIGTERM, on_signal);
     (void)std::signal(SIGINT, on_signal);
+
+    if (admin) {
+      admin->start();
+    }
 
     const std::string upstream =
         cluster_seeds.empty()
@@ -162,6 +187,9 @@ int main(int argc, char** argv) {
 
     pool.run();
 
+    if (admin) {
+      admin->stop();  // outlives the data plane so a scrape can catch the drain
+    }
     VKP_LOG_INFO("shutdown complete");
   } catch (const std::exception& e) {
     VKP_LOG_ERROR("fatal: {}", e.what());

@@ -1,0 +1,2 @@
+GET /topology?verbose HTTP/1.1
+
