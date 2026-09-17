@@ -20,7 +20,7 @@
 | M2 | 事件循环 + 最小可用 proxy | `valkey-cli` 可通过 proxy 访问单个后端 | ✅ 完成（2026-08-31） |
 | M3 | 多线程 + 连接池 + pipelining | 可承受多连接压测的生产形态骨架 | ✅ 完成（2026-09-07） |
 | M4 | cluster 路由 | 对接 valkey cluster，处理 MOVED/ASK | ✅ 完成（2026-09-10） |
-| M5 | 可观测性与配置 | metrics / 日志 / 配置 / 优雅关闭 | |
+| M5 | 可观测性与配置 | metrics / 日志 / 配置 / 优雅关闭 | ✅ 完成（2026-09-17） |
 | M6 | 性能打磨 | 基线固化与针对性优化 | |
 
 依赖关系：M1 与 M2 可部分并行（M1 不依赖任何 IO 代码）；其余按序进行。
@@ -469,7 +469,9 @@
 
 ---
 
-## M5 — 可观测性与配置
+## M5 — 可观测性与配置 ✅
+
+**状态**：已完成（2026-09-17）。设计文档：[docs/design/m5-observability-config.md](design/m5-observability-config.md)。
 
 **目标**：让它可以被真正运维。
 
@@ -481,7 +483,89 @@
 4. **配置**：TOML 配置文件（监听、后端、线程数、超时、上限等）+ CLI11 命令行覆盖；启动时校验并打印生效配置。热重载留作 backlog。
 5. **完善优雅关闭**：drain 模式（停止 accept、在途完成、连接逐个关闭）、超时兜底。
 
-**验收标准**：Prometheus 抓取 + Grafana 能画出 QPS/延迟/连接数核心面板；kill -TERM 在压测中不产生客户端错误。
+**验收标准**：Prometheus 抓取 + Grafana 能画出 QPS/延迟/连接数核心面板；kill -TERM 在压测中不产生客户端错误。**两项均达成**，实测见下。
+
+**实施记录（与计划的偏差）**：
+
+- **指标跨线程用「每 worker 一块 cache-line 对齐的计数块 + 松弛原子 + 单写者」**，不是
+  完全零共享。owner 用 `relaxed load + store` 自增（arm64 上是普通 LDR/STR，没有 LDADD），
+  admin 线程 `relaxed` 读。比 M0~M4 贯穿的「worker 之间零共享可变状态」松一档，但换来的是
+  约 30 行实现与零热路径代价；TSan 下压测零报告（见下）。
+- **admin 接口跑在独立线程的独立 `event_loop` 上**，不蹭 worker。渲染一次 `/metrics` 要拼
+  几 KB 字符串，放在数据面 loop 上会直接污染 M6 要测的 p99。默认只绑 `127.0.0.1:9180`，
+  `--admin-listen ""` 关闭。
+- **新增 `event_loop::now()`**（每轮迭代缓存的 `steady_clock::now()`，`expire_timers()`
+  本来就每轮取一次）。两条延迟直方图的打点因此是**零 syscall**——这是下面「开销测不出来」
+  的直接原因。只给 metrics 用；`backend_conn` 的超时判定仍用真实时钟，不改既有超时语义。
+- **`/topology` 快照用 `std::mutex` + 预渲染字符串**，每 worker 一份，`adopt()` 后更新。
+  控制面 0.2 Hz、数据面永不触碰，这样绕开了 `std::atomic<std::shared_ptr>` 的基线可用性
+  问题（与 `std::expected` 同一类坑）。
+- **不在容器里立 Grafana**（计划偏差，M5 计划阶段已决定）：镜像拉取代价与验证价值不成
+  正比。改为仓库内提供 [deploy/grafana-dashboard.json](../deploy/grafana-dashboard.json)
+  （18 个面板，由 `deploy/gen-dashboard.py` 生成，别手改 JSON），并用真 Prometheus 逐条
+  验证每个面板的查询都能返回序列——**28 条查询全部有数据**，见下。
+- **优雅关闭比计划多做了三件 TCP 层的事**。计划只写了「停 accept、在途完成、连接逐个
+  关闭」，但光做到这些，客户端拿到的是 RST 而不是 FIN，已经发出、客户端还没读走的回复会
+  被内核丢掉。补齐的三点（细节见 `7de7fc9`）：最后一个字节与 FIN 同一轮写出；
+  `close_if_idle()` 用 `MSG_PEEK` 确认接收缓冲真空，已经到达的请求不会被 cancel；关 fd
+  前把擦肩而过的字节读掉。
+- **`cluster-loadcheck.py --expect-close` 引入三档判据**。RESP 没有协议级的告别帧，所以
+  「drain 期间零客户端错误」这句话必须先定义清楚：相位边界上的干净 EOF 记 `drained`
+  （成功），刚发出的批次一条回复都没等到记 `raced`（字节与 FIN 在线上交错，重连重试即可），
+  批次答了一半或任何 reset 才记 `error`。边界靠 poll 而不是靠写失败推断——往已关闭的
+  socket 写会把对端的 FIN 变成 RST，反而抹掉证据。
+- **两个 drain 单测必须用跨线程阻塞客户端**。共享 proxy loop 的协程客户端看不到这件事：
+  drain 末尾的 `loop.stop()` 会先把它 pending 的 recv cancel 掉（`-ECANCELED`），哪怕
+  字节已经躺在它的 socket 缓冲里。先在 `proxy_test.cpp` 里写错过一版。
+- **clang-18 的 `-Wmissing-field-initializers` 又咬了一次**（`346831b`）：
+  `return {.st = state::bad_request}` 在 Apple Clang 21 下干净，在基线编译器上是错误，
+  五条矩阵腿全倒在同一个文件。本机编译器比基线宽松，容器矩阵是唯一的判据。
+
+**验收实测**（容器 `vkp-build`，Ubuntu 24.04 / arm64 / 18 vCPU，OrbStack）：
+
+- **矩阵五连**：clang-18 Debug、GCC-14 Debug、ASan+UBSan（`detect_leaks=1`）、
+  **TSan**、clang-18 Release —— 125 个测试全过，零警告。
+- **Fuzz 60 秒**：`resp_parser` 494 万次执行、`admin_http` 5927 万次执行，无 crash /
+  无泄漏。新语料 `-merge=1` 精简后提交（983 → 471、78 → 24）。
+- **`promtool check metrics`**（Prometheus 3.14.0）：78 条序列全部合规。
+- **真 Prometheus 抓取**：1 秒抓取间隔，`rate(vkp_requests_total[1m])`、
+  `histogram_quantile(0.99, ...)`、`vkp_client_connections` 等**面板全部 28 条查询
+  均返回序列**。连接类 gauge 需要在压测*进行中*采样才看得到（40 客户端时
+  `vkp_client_connections=40`、每 worker `[9 12 12 7]`、`vkp_backend_inflight` 在 0~15
+  间摆动，客户端散去后回 0）——压测跑完再抓只会看到 0，早先误判过一次。
+- **SIGTERM 压测验收**（release，4 worker，32 客户端 × pipeline 16，压测中 `kill -TERM`，
+  grace 5000 ms，连跑三次）：`errors=0 mismatches=0`，`drained` 26~31/32、其余 `raced`，
+  约 52 万 rps。**drain 在约 1 毫秒内完成**，而不是像改造前那样耗光 5 秒 grace 再硬停。
+  日志里四个 worker 各自打出完整阶段序列（`draining` → `drained cleanly` → `shutdown
+  complete`）。
+- **同一套验收在 TSan 构建下重跑三次**：`errors=0 mismatches=0`，约 39.5 万 rps，
+  **零 ThreadSanitizer 报告**——这是本里程碑引入跨线程读之后最想看到的一条。
+- **`/health` 翻 503**：正常时 200 `{"status":"ok"}`；SIGTERM 后立刻 503
+  `{"status":"draining"}`，同时那条在途请求仍然拿到了正确回复。drain 太快（亚毫秒）以至于
+  探针抓不到，这里是用 `DEBUG SLEEP 2` 把一条请求按住才观测到的。
+
+**性能回归（验收项）**。计划要求按 M3「基线 A」同一命令行复跑，门槛 <1%、超 2% 则加
+`--metrics-latency=off` 开关。**直接对 M3 表格比数字这次不成立**：那张表里的直连对照今天
+落在慢模式（单线程 redis-server 的核放置随机，M3 就记过 `-P 16` 直连在 2.0M 与 3.33M 之间
+双峰跳变），照抄比较会把机器状态读成代码回归。改为**同一轮内交替测两个二进制**的 A/B，
+后端是同一个 redis 进程，A = `0b3d7ad`（M5 之前，无日志无指标无 admin），B = HEAD：
+
+| 命令 | P | A 三轮 rps | B 三轮 rps | p50（A → B） |
+|---|---|---|---|---|
+| SET | 16 | 2,497,502 / 2,497,502 / 2,497,502 | 2,497,502 / 2,496,255 / 2,498,750 | 0.263 → 0.263 |
+| GET | 16 | 2,855,511 / 2,497,502 / 2,853,881 | 2,497,502 / 2,853,881 / 2,853,881 | 0.247 → 0.247 |
+| SET | 1 | 307,503 / 307,598 / 307,503 | 307,503 / 307,503 / 307,314 | 0.135 → 0.135 |
+| GET | 1 | 307,598 / 307,409 / 307,503 | 307,598 / 307,503 / 307,503 | 0.135 → 0.135 |
+
+  解读：
+
+  - **埋点开销低于测量分辨率**。吞吐差异在 ±0.06% 以内，p50 逐位相同，p99 的差异
+    （SET 0.626 → 0.623、GET 0.572 → 0.583 ms，三轮均值）只有两三个 redis-benchmark
+    延迟刻度，两个方向都有。**不需要 `--metrics-latency=off`**，不加这个开关。
+  - `event_loop::now()` 是这个结果的原因：两条直方图打点各自省掉一次
+    `clock_gettime`，剩下的只有一次桶内线性扫 + 几个 relaxed store。
+  - **GET `-P 16` 的双峰在 A 和 B 上都出现，且与二进制无关**（A 出现两次高模、B 出现
+    两次高模）。这条正是不能直接对 M3 表格的证据，也提醒 M6 测优化效果时必须同轮 A/B。
 
 ---
 
