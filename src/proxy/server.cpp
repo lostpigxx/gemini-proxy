@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <sys/socket.h>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -223,6 +224,8 @@ std::string route_error_reply(routing::status st, const command_info* info) {
   return std::string{kErrNoTopology};
 }
 
+}  // namespace
+
 // One client connection: a reader (frames → command table → backend queue)
 // and a writer (flushes the outbound byte queue). Replies arrive via
 // deliver() from a backend connection's driver.
@@ -236,9 +239,10 @@ std::string route_error_reply(routing::status st, const command_info* info) {
 // lets cluster routing fan a client out across nodes.
 class client_conn final : public reply_sink {
  public:
-  client_conn(io::event_loop& loop, io::unique_fd fd, router& rtr, metrics::worker_stats& stats,
-              std::size_t outbuf_limit, std::size_t max_redirects)
-      : loop_(loop),
+  client_conn(server& owner, io::event_loop& loop, io::unique_fd fd, router& rtr,
+              metrics::worker_stats& stats, std::size_t outbuf_limit, std::size_t max_redirects)
+      : owner_(owner),
+        loop_(loop),
         fd_(std::move(fd)),
         router_(rtr),
         stats_(stats),
@@ -247,7 +251,14 @@ class client_conn final : public reply_sink {
         may_redirect_(rtr.may_redirect()),
         out_ready_(loop),
         drained_(loop),
-        writer_done_(loop) {}
+        writer_done_(loop) {
+    owner_.link(*this);
+  }
+
+  ~client_conn() { owner_.unlink(*this); }
+
+  client_conn(const client_conn&) = delete;
+  client_conn& operator=(const client_conn&) = delete;
 
   // Runs the whole lifecycle; when it returns, both coroutines have exited
   // and the connection is detached from the backend queue.
@@ -270,6 +281,9 @@ class client_conn final : public reply_sink {
     out_ready_.notify_all();
     while (writer_live_) {
       (void)co_await writer_done_.wait();
+    }
+    if (!aborting_) {
+      discard_late_input();
     }
     // Under cluster routing one client may have queued onto several nodes,
     // so every connection it touched needs the tombstone.
@@ -295,6 +309,17 @@ class client_conn final : public reply_sink {
       }
     }
     fill(index, frame);
+  }
+
+  // The process is shutting down. A client that is between requests is closed
+  // right here — waiting for it to notice is what used to make an idle pooled
+  // connection hold the whole drain open until the grace timer fired, and the
+  // hard stop that followed cut off whoever *was* mid-request. One with work
+  // in flight is left alone; close_if_idle() picks it up when its last reply
+  // goes out. Returns true if this call closed the connection.
+  bool begin_drain() noexcept {
+    draining_ = true;
+    return close_if_idle();
   }
 
  private:
@@ -348,6 +373,7 @@ class client_conn final : public reply_sink {
     }
     if (slots_.empty()) {
       drained_.notify_all();
+      close_if_idle();  // no-op unless the process is draining
     }
     if (out_.size() > outbuf_limit_) {
       stats_.bump_error(metrics::error_kind::outbuf_limit);
@@ -437,7 +463,15 @@ class client_conn final : public reply_sink {
     read_buffer in;
     resp::parser parser;
     for (;;) {
+      // True only while nothing of a request has been read yet — the one
+      // moment at which drain may close this connection without losing a
+      // request the client believes it has sent.
+      at_frame_boundary_ = in.readable_bytes() == 0;
+      if (close_if_idle()) {
+        co_return;  // drain started while we were busy; this is the boundary
+      }
       const frame_result fr = co_await read_frame(loop_, fd_.get(), in, parser, &recv_slot_);
+      at_frame_boundary_ = false;
       if (aborting_) {
         co_return;
       }
@@ -527,6 +561,13 @@ class client_conn final : public reply_sink {
       }
       if (out_.empty()) {
         if (closing_) {
+          // The FIN goes out in the same turn as the last byte rather than
+          // after this coroutine and run() have unwound. A client that reads
+          // its reply and only learns of the close a scheduling round later
+          // has time to pipeline the next request into a socket we are about
+          // to drop — and closing on top of unread data is a reset, which
+          // costs it the replies it had not read yet.
+          (void)::shutdown(fd_.get(), SHUT_WR);
           break;
         }
         if (co_await out_ready_.wait() < 0) {
@@ -550,6 +591,46 @@ class client_conn final : public reply_sink {
     writer_done_.notify_all();
   }
 
+  // Closes the connection if it owes the client nothing and has nothing
+  // half-read. Cancelling the receive is enough: the reader returns, run()
+  // finds no slots to wait for, and the writer flushes whatever is already
+  // queued before the fd is dropped — so the client gets every byte it was
+  // promised and then a clean FIN, at a request boundary. That is a close a
+  // correct client retries through; killing it mid-frame is not.
+  bool close_if_idle() noexcept {
+    if (!draining_ || aborting_ || closing_ || !slots_.empty() || !at_frame_boundary_) {
+      return false;
+    }
+    // "Idle" has to mean the socket too, not just our own bookkeeping. A
+    // request whose bytes are already in the receive buffer — or whose recv
+    // completion is queued but not yet dispatched — would be thrown away by
+    // the cancel below, and the client would be right to call that a lost
+    // request. Whoever is in that state gets served first; the fill() that
+    // finishes them comes straight back here.
+    char peek = 0;
+    if (::recv(fd_.get(), &peek, 1, MSG_PEEK | MSG_DONTWAIT) > 0) {
+      return false;
+    }
+    closing_ = true;
+    loop_.cancel(recv_slot_);  // also short-circuits the reader's next submit
+    return true;
+  }
+
+  // Closing on top of unread bytes is a reset, and a reset can destroy replies
+  // the client has not read yet. Whatever landed after we decided to close is
+  // a request we are never going to answer — but discarding it costs the
+  // client only that one request, which it can retry, instead of the answers
+  // it was already given. Bounded, so a client that keeps blasting cannot make
+  // shutdown spin here.
+  void discard_late_input() noexcept {
+    char scratch[4096];
+    for (int i = 0; i < 16; ++i) {
+      if (::recv(fd_.get(), scratch, sizeof(scratch), MSG_DONTWAIT) <= 0) {
+        return;
+      }
+    }
+  }
+
   void abort_now() noexcept {
     if (aborting_) {
       return;
@@ -562,6 +643,12 @@ class client_conn final : public reply_sink {
     out_ready_.notify_all();
     drained_.notify_all();
   }
+
+  friend class server;  // for the intrusive list links below
+
+  server& owner_;
+  client_conn* prev_ = nullptr;
+  client_conn* next_ = nullptr;
 
   io::event_loop& loop_;
   io::unique_fd fd_;
@@ -580,6 +667,8 @@ class client_conn final : public reply_sink {
   bool closing_ = false;
   bool writer_live_ = false;
   bool writer_sending_ = false;
+  bool draining_ = false;
+  bool at_frame_boundary_ = false;
 
   io::wait_queue out_ready_;
   io::wait_queue drained_;
@@ -587,8 +676,6 @@ class client_conn final : public reply_sink {
   io::cancel_slot recv_slot_;
   io::cancel_slot send_slot_;
 };
-
-}  // namespace
 
 namespace {
 
@@ -626,9 +713,48 @@ void server::begin_shutdown() {
     return;
   }
   draining_ = true;
-  VKP_LOG_INFO("draining: no longer accepting, {inflight} connection(s) in flight", active_);
   loop_.cancel(accept_cancel_);
+  // Idle clients go first. Nothing wakes a pooled connection that is simply
+  // sitting there, so without this the drain always ran to the grace timer and
+  // then hard-stopped — taking out whatever genuinely was in flight.
+  std::size_t closed = 0;
+  for (client_conn* c = conns_; c != nullptr;) {
+    client_conn* next = c->next_;  // c may unlink itself before we get back
+    closed += static_cast<std::size_t>(c->begin_drain());
+    c = next;
+  }
+  VKP_LOG_INFO(
+      "draining: no longer accepting, {idle} idle connection(s) closed, "
+      "{inflight} of {open} still working",
+      closed, active_ - closed, active_);
   io::spawn(watchdog());
+}
+
+void server::link(client_conn& c) noexcept {
+  c.prev_ = nullptr;
+  c.next_ = conns_;
+  if (conns_ != nullptr) {
+    conns_->prev_ = &c;
+  }
+  conns_ = &c;
+  if (draining_) {
+    // Accepted in the same ready-queue round that the drain byte arrived in.
+    // It closes at its first frame boundary rather than waiting out the grace.
+    (void)c.begin_drain();
+  }
+}
+
+void server::unlink(client_conn& c) noexcept {
+  if (c.prev_ != nullptr) {
+    c.prev_->next_ = c.next_;
+  } else if (conns_ == &c) {
+    conns_ = c.next_;
+  }
+  if (c.next_ != nullptr) {
+    c.next_->prev_ = c.prev_;
+  }
+  c.prev_ = nullptr;
+  c.next_ = nullptr;
 }
 
 io::task<void> server::watchdog() {
@@ -669,8 +795,13 @@ io::task<void> server::connection(io::unique_fd client) {
   // -plane event frequent enough to cost something, so it stays off by default.
   VKP_LOG_DEBUG("client connected on port {port}, {open} open", port_, active_);
   {
-    client_conn c{loop_,  std::move(client),        router_,
-                  stats_, cfg_.client_outbuf_limit, cfg_.max_redirects};
+    client_conn c{*this,
+                  loop_,
+                  std::move(client),
+                  router_,
+                  stats_,
+                  cfg_.client_outbuf_limit,
+                  cfg_.max_redirects};
     try {
       co_await c.run();
     } catch (const std::exception&) {

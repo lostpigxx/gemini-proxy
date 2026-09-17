@@ -40,6 +40,10 @@ struct config {
   backend_conn_config backend;
 };
 
+// Defined in server.cpp. The server keeps an intrusive list of the live ones
+// so that drain can reach them; see server::begin_shutdown.
+class client_conn;
+
 class server {
  public:
   // Resolves the backend address and binds the listener immediately (throws
@@ -54,19 +58,25 @@ class server {
   // Actual listen port (after an ephemeral bind with listen_port = 0).
   [[nodiscard]] std::uint16_t port() const { return port_; }
 
-  // First call: stop accepting, let in-flight connections drain, then drain
-  // the backend pool and stop the loop (or after shutdown_grace). Second
-  // call: stop immediately.
+  // First call: stop accepting, close every client that is between requests,
+  // let the rest finish what is in flight, then drain the backend pool and
+  // stop the loop (or after shutdown_grace). Second call: stop immediately.
   void begin_shutdown();
 
   [[nodiscard]] std::size_t active_connections() const noexcept { return active_; }
 
  private:
+  friend class client_conn;  // for link/unlink only
+
   io::task<void> acceptor();
   io::task<void> connection(io::unique_fd client);
   io::task<void> watchdog();
   io::task<void> drain_backends();
   void maybe_drain_backends();
+  // O(1) both ways: connection churn can be high and an erase-by-value from a
+  // vector would make teardown quadratic.
+  void link(client_conn& c) noexcept;
+  void unlink(client_conn& c) noexcept;
 
   io::event_loop& loop_;
   config cfg_;
@@ -75,6 +85,7 @@ class server {
   io::unique_fd listener_;
   std::uint16_t port_ = 0;
   io::cancel_slot accept_cancel_;
+  client_conn* conns_ = nullptr;  // head of the intrusive list of live clients
   std::size_t active_ = 0;
   bool draining_ = false;
   bool backend_drain_started_ = false;
