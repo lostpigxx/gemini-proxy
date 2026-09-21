@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <string>
 #include <sys/socket.h>
@@ -13,10 +14,12 @@
 
 #if defined(__linux__)
 #include <pthread.h>
+#include <sched.h>
 #endif
 
 #include <fmt/format.h>
 
+#include "core/log.hpp"
 #include "io/task.hpp"
 
 namespace vkp::proxy {
@@ -58,22 +61,57 @@ void set_nonblocking(int fd) {
   (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
 }
 
-// Pins worker i to CPU i % ncpu. No-op off Linux — but still a call, so the
-// flag is read on every platform (an #if around the call site instead would
-// make cpu_affinity_ an unused private field on macOS).
+// Pins worker i to the i-th CPU *this process is already allowed to run on*,
+// not to CPU i. Numbering from zero ignores any mask we were started under, so
+// `taskset -c 5-8 proxyd --cpu-affinity -w 4` used to ask for CPUs 0..3, get
+// EINVAL from every call, and silently leave the workers floating — which is
+// how a pinned benchmark still came out bistable (two workers sharing a core
+// on some runs and not others, an 8% throughput swing between rounds).
+//
+// No-op off Linux — but still a call, so the flag is read on every platform
+// (an #if around the call site instead would make cpu_affinity_ an unused
+// private field on macOS).
 void pin_threads([[maybe_unused]] bool enabled,
                  [[maybe_unused]] std::vector<std::thread>& threads) {
 #if defined(__linux__)
   if (!enabled) {
     return;
   }
-  const unsigned ncpu = std::max(1U, std::thread::hardware_concurrency());
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+    VKP_LOG_WARN("cpu affinity: sched_getaffinity failed: {error}", std::strerror(errno));
+    return;
+  }
+  std::vector<int> cpus;
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &allowed)) {
+      cpus.push_back(cpu);
+    }
+  }
+  if (cpus.empty()) {
+    return;
+  }
+  if (cpus.size() < threads.size()) {
+    // Oversubscribed: pinning would stack workers on the same core with none
+    // of them able to migrate off it. Leaving the mask alone is strictly
+    // better, and silently doing so is how you end up debugging it twice.
+    VKP_LOG_WARN("cpu affinity: {workers} worker(s) but only {cpus} cpu(s) available, not pinning",
+                 threads.size(), cpus.size());
+    return;
+  }
   for (std::size_t i = 0; i < threads.size(); ++i) {
     cpu_set_t set;
     CPU_ZERO(&set);
-    CPU_SET(i % ncpu, &set);
-    (void)pthread_setaffinity_np(threads[i].native_handle(), sizeof(set), &set);
+    CPU_SET(cpus[i], &set);
+    const int rc = pthread_setaffinity_np(threads[i].native_handle(), sizeof(set), &set);
+    if (rc != 0) {
+      VKP_LOG_WARN("cpu affinity: worker {worker} -> cpu {cpu} failed: {error}", i, cpus[i],
+                   std::strerror(rc));
+    }
   }
+  VKP_LOG_INFO("cpu affinity: {workers} worker(s) pinned, first cpu {cpu}", threads.size(),
+               cpus.front());
 #endif
 }
 
