@@ -203,22 +203,45 @@ done
 printf 'round\tarm\tcmd\tpipeline\tsize\tclients\trequests\trps\trps_reported\tavg\tp50\tp95\tp99\tcpu_us_per_req\n' \
   > "${RESULTS}"
 
-# Total CPU ticks (utime+stime, all threads) of a process. Fields 14/15 of
-# /proc/pid/stat, counted past the comm field because a process name may
-# contain spaces or parentheses.
-cpu_ticks() {
-  [[ -z "$1" || ! -r "/proc/$1/stat" ]] && { echo ""; return; }
+# Total CPU nanoseconds consumed by a process, summed over its threads.
+#
+# Field 0 of /proc/<pid>/task/<tid>/schedstat is the scheduler's own
+# accumulated run time in nanoseconds — measured, not sampled. The obvious
+# alternative, utime+stime from /proc/<pid>/stat, is sampled by the 100 Hz
+# tick: a `-P 16` run is ~3 s of wall time in which four workers are each only
+# ~22% busy, so the whole measurement rests on ~265 ticks and its binomial
+# sampling error is ±5%. That is larger than every optimisation M6 has on its
+# list, and it is why an A/B of the clock change first read as a 7% win and
+# then as nothing. schedstat has no such floor: repeated runs of one binary
+# agree to a fraction of a percent.
+#
+# schedstat needs CONFIG_SCHEDSTATS and reads as all-zero without it, so fall
+# back to the tick counter rather than silently reporting zero.
+cpu_ns() {
+  [[ -z "$1" || ! -d "/proc/$1/task" ]] && { echo ""; return; }
   python3 - "$1" <<'PY'
-import sys
+import os, sys
+pid = sys.argv[1]
+total = 0
 try:
-    raw = open(f"/proc/{sys.argv[1]}/stat").read()
+    for tid in os.listdir(f"/proc/{pid}/task"):
+        try:
+            with open(f"/proc/{pid}/task/{tid}/schedstat") as fh:
+                total += int(fh.read().split()[0])
+        except (OSError, IndexError, ValueError):
+            continue
 except OSError:
     print(""); raise SystemExit
-fields = raw[raw.rindex(")") + 2:].split()
-print(int(fields[11]) + int(fields[12]))  # utime, stime (field 14, 15)
+if total > 0:
+    print(total); raise SystemExit
+try:
+    raw = open(f"/proc/{pid}/stat").read()
+except OSError:
+    print(""); raise SystemExit
+f = raw[raw.rindex(")") + 2:].split()
+print((int(f[11]) + int(f[12])) * (10 ** 9 // os.sysconf("SC_CLK_TCK")))
 PY
 }
-HZ="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 
 # Runs one scenario against one arm and appends a TSV row. redis-benchmark's
 # --csv is parsed instead of its human output: the "====== SET ======" banner
@@ -232,7 +255,7 @@ run_one() {
   local log="${LOGDIR}/${tag}.csv"
 
   local t0 t1 c0 c1 cpu_us=""
-  c0="$(cpu_ticks "${ARM_PID[${label}]}")"
+  c0="$(cpu_ns "${ARM_PID[${label}]}")"
   t0="$(date +%s%N)"
   "${PIN[@]}" "${BENCH}" -h "${host}" -p "${port}" -t "${cmd,,}" -n "${reqs}" -c "${clients}" \
     -P "${pipe}" -d "${size}" -r "${KEYSPACE}" --threads "${THREADS}" --csv \
@@ -241,9 +264,9 @@ run_one() {
       return 1
     }
   t1="$(date +%s%N)"
-  c1="$(cpu_ticks "${ARM_PID[${label}]}")"
+  c1="$(cpu_ns "${ARM_PID[${label}]}")"
   if [[ -n "${c0}" && -n "${c1}" ]]; then
-    cpu_us="$(python3 -c "print(f'{(${c1} - ${c0}) / ${HZ} * 1e6 / ${reqs}:.3f}')")"
+    cpu_us="$(python3 -c "print(f'{(${c1} - ${c0}) / 1e3 / ${reqs}:.4f}')")"
   fi
 
   python3 - "${log}" "${round}" "${label}" "${cmd}" "${pipe}" "${size}" "${clients}" "${reqs}" \
@@ -278,29 +301,46 @@ if [[ "${WARMUP}" -eq 1 ]]; then
   #
   # Sizes are the largest in the matrix so the values left behind are the ones
   # the GET scenarios will read back.
-  echo "fill: ${KEYSPACE} keys ..."
+  #
+  # Every distinct endpoint gets its own fill, not just the first arm. Arms
+  # usually share a backend, where the repeats are merely redundant — but a
+  # standalone-vs-cluster comparison has each arm on its own storage, and
+  # filling only arm 0 leaves the other one answering every GET with a miss.
+  # That is the §1.1 trap with the arms swapped, and it would read as the
+  # cluster path being 2.6x faster than it is.
   maxsize=32
   for scenario in "${SCENARIOS[@]}"; do
     read -r _c _p s _cl _n <<< "${scenario}"
     (( s > maxsize )) && maxsize="${s}"
   done
-  addr="${ARM_ADDR[${ARM_ORDER[0]}]}"
-  "${PIN[@]}" "${BENCH}" -h "${addr%:*}" -p "${addr##*:}" -t set -n $((KEYSPACE * 4)) \
-    -c 50 -P 16 -d "${maxsize}" -r "${KEYSPACE}" --threads "${THREADS}" --csv >/dev/null 2>&1 || true
 
-  if [[ -n "${CLI}" ]]; then
-    a="${ARM_ADDR[${ARM_ORDER[0]}]}"
-    DBSIZE="$("${CLI}" -h "${a%:*}" -p "${a##*:}" dbsize 2>/dev/null || echo "n/a")"
-    if [[ "${DBSIZE}" =~ ^[0-9]+$ ]]; then
-      pct=$((100 * DBSIZE / KEYSPACE))
-      echo "  dbsize=${DBSIZE} (${pct}% of keyspace)"
+  declare -A FILLED
+  dbsizes=()
+  for label in "${ARM_ORDER[@]}"; do
+    addr="${ARM_ADDR[${label}]}"
+    [[ -n "${FILLED[${addr}]:-}" ]] && continue
+    FILLED["${addr}"]=1
+    echo "fill: ${KEYSPACE} keys via ${label} (${addr}) ..."
+    "${PIN[@]}" "${BENCH}" -h "${addr%:*}" -p "${addr##*:}" -t set -n $((KEYSPACE * 4)) \
+      -c 50 -P 16 -d "${maxsize}" -r "${KEYSPACE}" --threads "${THREADS}" --csv >/dev/null 2>&1 || true
+
+    [[ -z "${CLI}" ]] && continue
+    size="$("${CLI}" -h "${addr%:*}" -p "${addr##*:}" dbsize 2>/dev/null || echo "n/a")"
+    if [[ "${size}" =~ ^[0-9]+$ ]]; then
+      pct=$((100 * size / KEYSPACE))
+      echo "  dbsize=${size} (${pct}% of keyspace)"
       if [[ "${pct}" -lt 95 ]]; then
-        echo "  WARNING: keyspace under-filled; GET numbers will mix hits and misses" >&2
+        echo "  WARNING: ${label} under-filled; its GET numbers will mix hits and misses" >&2
       fi
+      dbsizes+=("${label}=${size}")
     else
-      echo "  dbsize unavailable (cluster mode rejects DBSIZE); GET hit rate unverified"
+      # A cluster-mode proxy has no single DBSIZE to report. The fill still
+      # happened; it just cannot be verified from here.
+      echo "  dbsize unavailable via ${label}; GET hit rate unverified"
+      dbsizes+=("${label}=n/a")
     fi
-  fi
+  done
+  [[ "${#dbsizes[@]}" -gt 0 ]] && DBSIZE="${dbsizes[*]}"
 
   echo "warmup ..."
   for label in "${ARM_ORDER[@]}"; do
@@ -369,8 +409,9 @@ keyspace = sys.argv[4] if len(sys.argv) > 4 else "?"
 print(f"# bench report\n")
 print(f"arms: {', '.join(arms)} — reference arm is `{ref}`; "
       f"median of {rounds} round(s), arms interleaved within each scenario.")
-print(f"keyspace {keyspace}, dbsize after fill {dbsize} — GET is a hit unless "
-      f"these disagree. rps is wall-clock, not redis-benchmark's 250 ms tick.\n")
+print(f"keyspace {keyspace}, dbsize after fill: {dbsize} — every distinct endpoint "
+      f"is filled separately, so GET is a hit on each arm unless one of these "
+      f"disagrees. rps is wall-clock, not redis-benchmark's 250 ms tick.\n")
 
 head = ["scenario"] + [f"{a} rps" for a in arms]
 if len(arms) > 1:
@@ -410,23 +451,36 @@ if cpu_arms:
         base = byarm.get(cpu_arms[0], {}).get("cpu_us_per_req")
         for a in cpu_arms:
             v = byarm.get(a, {}).get("cpu_us_per_req")
-            cells.append(f"{v:.3f}" if v is not None else "-")
+            cells.append(f"{v:.4f}" if v is not None else "-")
         for a in cpu_arms[1:]:
             v = byarm.get(a, {}).get("cpu_us_per_req")
             cells.append(f"{100 * v / base:.1f}%" if v is not None and base else "-")
         print("| " + " | ".join(cells) + " |")
 
-# Spread across rounds, so a reader can tell a 3% win from this machine's noise.
-print("\n## per-round spread (rps, min..max over rounds)\n")
+# Spread across rounds, so a reader can tell a 3% win from this machine's
+# noise. Both metrics: they have different noise floors, and the one the
+# verdict rests on is CPU.
+print("\n## per-round spread (min..max over rounds)\n")
 spread = OrderedDict()
 for r in rows:
-    spread.setdefault((key(r), r["arm"]), []).append(float(r["rps"]))
-print("| scenario | arm | min | max | spread |")
-print("|---|---|---|---|---|")
-for (k, arm), vals in spread.items():
-    lo, hi = min(vals), max(vals)
+    e = spread.setdefault((key(r), r["arm"]), {"rps": [], "cpu": []})
+    e["rps"].append(float(r["rps"]))
+    if r.get("cpu_us_per_req"):
+        e["cpu"].append(float(r["cpu_us_per_req"]))
+print("| scenario | arm | rps min | rps max | rps spread | cpu min | cpu max | cpu spread |")
+print("|---|---|---|---|---|---|---|---|")
+for (k, arm), e in spread.items():
+    lo, hi = min(e["rps"]), max(e["rps"])
     pct = (hi - lo) / lo * 100 if lo else 0.0
-    print(f"| {k[0]} P={k[1]} d={k[2]} c={k[3]} | {arm} | {lo:,.0f} | {hi:,.0f} | {pct:.1f}% |")
+    cells = [f"{k[0]} P={k[1]} d={k[2]} c={k[3]}", arm,
+             f"{lo:,.0f}", f"{hi:,.0f}", f"{pct:.1f}%"]
+    if e["cpu"]:
+        clo, chi = min(e["cpu"]), max(e["cpu"])
+        cells += [f"{clo:.4f}", f"{chi:.4f}",
+                  f"{(chi - clo) / clo * 100 if clo else 0.0:.1f}%"]
+    else:
+        cells += ["-", "-", "-"]
+    print("| " + " | ".join(cells) + " |")
 
 baseline = sys.argv[2] if len(sys.argv) > 2 else ""
 if baseline:
