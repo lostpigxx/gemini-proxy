@@ -81,7 +81,13 @@ void backend_conn::set_state(state s) noexcept {
 void backend_conn::push(reply_sink* sink, std::uint64_t token, std::string_view frame) {
   assert(available());
   const bool was_empty = inflight_.empty();
-  const auto now = std::chrono::steady_clock::now();
+  // The loop's cached stamp, not a fresh clock read. This runs once per
+  // request, and on this box a CLOCK_MONOTONIC read is expensive enough that
+  // this call plus the one in deliver_head() were 46% of the proxy's user CPU
+  // under `-P 16` — more than parsing, routing and the ring put together.
+  // Staleness is bounded by one loop iteration, which is microseconds against
+  // a timeout measured in seconds (design m6 §2).
+  const auto now = loop_.now();
   out_.append(frame);
   inflight_.push_back({.sink = sink, .token = token, .deadline = now + cfg_.request_timeout});
   stats_.backend_inflight.inc();
@@ -137,8 +143,11 @@ void backend_conn::deliver_head(std::string_view frame) {
   // Sampled before deliver(), which hands the frame to the client and can run
   // a whole flush — that work is proxy time, not backend time. The start
   // stamp is recovered from the deadline push() already computed, so backend
-  // latency costs no clock read of its own (design m5 §2).
-  const auto now = std::chrono::steady_clock::now();
+  // latency costs no clock read of its own (design m5 §2). The loop's cached
+  // stamp for the same reason push() uses it (design m6 §2); both ends of the
+  // sample now come from the same clock, and a request's two stamps are
+  // always separated by at least one poll, so the interval never collapses.
+  const auto now = loop_.now();
   stats_.backend_duration.observe(now - (e.deadline - cfg_.request_timeout));
   if (e.sink != nullptr) {
     e.sink->deliver(e.token, frame);
@@ -151,7 +160,7 @@ void backend_conn::deliver_head(std::string_view frame) {
 }
 
 void backend_conn::fail_all() noexcept {
-  const auto now = std::chrono::steady_clock::now();
+  const auto now = loop_.now();
   const std::string_view fwd_error =
       session_was_connected_ ? kErrBackendLost : kErrBackendUnavailable;
   while (!inflight_.empty()) {
