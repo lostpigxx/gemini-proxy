@@ -220,6 +220,29 @@ TEST_CASE("malformed input yields protocol errors", "[resp][parser]") {
   REQUIRE(error_of("%?\r\n") == parse_errc::streamed_not_supported);
 }
 
+TEST_CASE("integer lines accept and reject across the fast-path seam", "[resp][parser]") {
+  // Length and integer lines take a digits-only fast path at 18 characters or
+  // fewer (18 digits cannot overflow int64, so the accumulate needs no
+  // per-digit check) and fall through to from_chars otherwise. These straddle
+  // that seam in both directions.
+  auto complete = [](std::string_view frame) {
+    parser p;
+    return p.parse(frame) == parse_status::complete;
+  };
+  CHECK(complete(":0\r\n"));
+  CHECK(complete(":000123\r\n"));                // leading zeros, fast path
+  CHECK(complete(":999999999999999999\r\n"));    // 18 digits, fast path
+  CHECK(complete(":9223372036854775807\r\n"));   // 19 digits, int64 max, from_chars
+  CHECK(complete(":-9223372036854775808\r\n"));  // int64 min, from_chars
+  CHECK(complete(":-1\r\n"));
+  CHECK(complete("$03\r\nfoo\r\n"));  // zero-padded bulk length
+
+  CHECK(error_of(":9223372036854775808\r\n") == parse_errc::bad_integer);   // overflows int64
+  CHECK(error_of(":99999999999999999999\r\n") == parse_errc::bad_integer);  // 20 digits
+  CHECK(error_of(":12345678901234567x\r\n") == parse_errc::bad_integer);    // 18 chars, trailing
+  CHECK(error_of(":0000000000000000001x\r\n") == parse_errc::bad_integer);  // 20 chars, trailing
+}
+
 TEST_CASE("defensive limits trip", "[resp][parser]") {
   SECTION("nesting depth") {
     limits lim;

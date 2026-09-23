@@ -11,7 +11,28 @@ namespace {
 
 // Strict int64 line: optional '-', digits, full consumption. RESP never uses
 // a leading '+' or whitespace in length/integer lines.
+//
+// The fast path exists because this runs three times per forwarded command
+// (`*N`, `$len` for the name, `$len` for each argument) and the lines are one
+// to three digits every time. Up to 18 digits cannot overflow int64, so the
+// accumulate needs no per-digit overflow check — which is most of what
+// from_chars is doing. Anything else (a sign, 19+ digits, junk) falls through
+// to from_chars, which stays the single owner of the edge cases.
 std::optional<std::int64_t> parse_i64(std::string_view s) {
+  if (!s.empty() && s.size() <= 18) {
+    std::uint64_t v = 0;
+    std::size_t i = 0;
+    for (; i < s.size(); ++i) {
+      const auto digit = static_cast<unsigned>(static_cast<unsigned char>(s[i]) - '0');
+      if (digit > 9) {
+        break;
+      }
+      v = (v * 10) + digit;
+    }
+    if (i == s.size()) {
+      return static_cast<std::int64_t>(v);
+    }
+  }
   std::int64_t v = 0;
   const char* end = s.data() + s.size();
   const auto [ptr, ec] = std::from_chars(s.data(), end, v);

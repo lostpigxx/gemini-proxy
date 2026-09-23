@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <charconv>
 #include <cstddef>
+#include <cstring>
 #include <system_error>
 
 #include "cluster/slot.hpp"
@@ -330,6 +330,86 @@ consteval std::size_t longest_name() {
 }
 constexpr std::size_t kLongestName = longest_name();
 
+static_assert(kCommands.size() < 256, "side-table indices below are uint8_t");
+
+consteval bool names_start_with_letter() {
+  for (const command_info& c : kCommands) {
+    if (c.name.empty() || c.name[0] < 'A' || c.name[0] > 'Z') {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(names_start_with_letter(), "first-letter index below assumes A-Z");
+
+// Two side tables that make the lookup a first-letter jump plus a byte-wide
+// length filter, instead of a binary search over 200-odd entries.
+//
+// The binary search cost ~8 `std::string_view` comparisons, and each one is an
+// out-of-line call into libc memcmp — `find_command` plus `memcmp` plus
+// `toupper` came to 10.7% of the proxy's user CPU (design m6 §3.3). Here the
+// first letter picks a contiguous range (the table is sorted by name, so it
+// is contiguous by construction), and `kNameLen` lets the scan reject
+// candidates one byte at a time rather than dragging a whole `command_info`
+// through the cache. Only an actual length match reaches memcmp, which in
+// practice means one or two calls instead of eight.
+//
+// Both are built from kCommands by consteval, so they cannot drift out of sync
+// with the table when a command is added.
+consteval std::array<std::uint8_t, kCommands.size()> build_name_lengths() {
+  std::array<std::uint8_t, kCommands.size()> lens{};
+  for (std::size_t i = 0; i < kCommands.size(); ++i) {
+    lens[i] = static_cast<std::uint8_t>(kCommands[i].name.size());
+  }
+  return lens;
+}
+constexpr auto kNameLen = build_name_lengths();
+
+struct name_range {
+  std::uint8_t begin;
+  std::uint8_t end;
+};
+
+consteval std::array<name_range, 26> build_first_ranges() {
+  std::array<name_range, 26> ranges{};
+  for (std::size_t letter = 0; letter < 26; ++letter) {
+    bool seen = false;
+    for (std::size_t i = 0; i < kCommands.size(); ++i) {
+      if (static_cast<std::size_t>(kCommands[i].name[0] - 'A') != letter) {
+        continue;
+      }
+      if (!seen) {
+        ranges[letter].begin = static_cast<std::uint8_t>(i);
+        seen = true;
+      }
+      ranges[letter].end = static_cast<std::uint8_t>(i + 1);
+    }
+  }
+  return ranges;
+}
+constexpr auto kFirstRange = build_first_ranges();
+
+// Exhaustive: every command must be reachable through the index, at its own
+// slot. A runtime test could only sample; this makes drift a build error the
+// moment a row is added in the wrong place.
+consteval bool index_finds_every_command() {
+  for (std::size_t i = 0; i < kCommands.size(); ++i) {
+    const std::string_view name = kCommands[i].name;
+    const name_range range = kFirstRange[static_cast<std::size_t>(name[0] - 'A')];
+    std::size_t hit = kCommands.size();
+    for (std::size_t j = range.begin; j < range.end && hit == kCommands.size(); ++j) {
+      if (kNameLen[j] == name.size() && kCommands[j].name == name) {
+        hit = j;
+      }
+    }
+    if (hit != i) {
+      return false;
+    }
+  }
+  return true;
+}
+static_assert(index_finds_every_command(), "first-letter/length index misses a command");
+
 // Walks the key spec and hands each key to `fn`. Shapes that contradict the
 // spec (short argv, unparsable or out-of-range numkeys) simply stop early —
 // callers treat "no keys" as "let the backend produce the arity error".
@@ -368,21 +448,36 @@ constexpr void each_key(std::span<const std::string_view> args, const command_in
 }  // namespace
 
 const command_info* find_command(std::string_view name) noexcept {
-  if (name.empty() || name.size() > kLongestName) {
+  const std::size_t len = name.size();
+  if (len == 0 || len > kLongestName) {
     return nullptr;
   }
   char upper[kLongestName];
-  for (std::size_t i = 0; i < name.size(); ++i) {
-    upper[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(name[i])));
+  for (std::size_t i = 0; i < len; ++i) {
+    const auto c = static_cast<unsigned char>(name[i]);
+    // ASCII-only uppercase, done without a branch the compiler has to guess
+    // at. `std::toupper` is a locale-aware libc call that will not inline;
+    // the proxy never calls setlocale, so its locale is "C" and the mapping
+    // it computes for these bytes is exactly this one. Bytes outside a-z are
+    // left alone, which matters: mapping them blindly with `& ~0x20` would
+    // fold DEL (0x7f) onto '_' and let "EVAL\x7fRO" match EVAL_RO.
+    upper[i] = static_cast<char>(c - (static_cast<unsigned char>(c - 'a') < 26 ? 0x20U : 0U));
   }
-  const std::string_view key{upper, name.size()};
-  const auto it = std::lower_bound(
-      kCommands.begin(), kCommands.end(), key,
-      [](const command_info& c, std::string_view k) noexcept { return c.name < k; });
-  if (it == kCommands.end() || it->name != key) {
+
+  const auto first = static_cast<unsigned char>(upper[0]);
+  if (first < 'A' || first > 'Z') {
     return nullptr;
   }
-  return &*it;
+  const name_range range = kFirstRange[first - 'A'];
+  for (std::size_t i = range.begin; i < range.end; ++i) {
+    if (kNameLen[i] != len) {
+      continue;
+    }
+    if (std::memcmp(kCommands[i].name.data(), upper, len) == 0) {
+      return &kCommands[i];
+    }
+  }
+  return nullptr;
 }
 
 route_result route_slot(std::span<const std::string_view> args, const command_info& info) noexcept {

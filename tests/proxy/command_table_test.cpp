@@ -1,6 +1,8 @@
 #include "proxy/command_table.hpp"
 
+#include <cctype>
 #include <initializer_list>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -40,6 +42,40 @@ TEST_CASE("lookup is case-insensitive", "[proxy][command_table]") {
     REQUIRE(info != nullptr);
     CHECK(info->name == "GET");
     CHECK(info->policy == cmd_policy::forward);
+  }
+}
+
+TEST_CASE("case folding is ASCII-only and invents no matches", "[proxy][command_table]") {
+  // The lookup folds case itself rather than calling toupper. The tempting
+  // one-instruction version, `c & ~0x20`, also maps 0x7b..0x7f onto
+  // '[',']','^','_' — which would let a DEL byte stand in for the underscore
+  // in EVAL_RO. Pin that it does not, and that the bytes on either side of
+  // 'a'..'z' survive untouched.
+  CHECK(find_command("EVAL_RO") != nullptr);
+  CHECK(find_command("eval_ro") != nullptr);
+  CHECK(find_command("EVAL\x7fRO") == nullptr);
+  CHECK(find_command("`ET") == nullptr);  // 0x60, one below 'a'
+  CHECK(find_command("{ET") == nullptr);  // 0x7b, one above 'z'
+  CHECK(find_command("1GET") == nullptr);
+  CHECK(find_command("GE\xf4") == nullptr);
+  CHECK(find_command("\xe4\xbd\xa0") == nullptr);  // non-ASCII, same length as GET
+
+  // A spread of first letters and name lengths, each in both cases, so the
+  // first-letter ranges and the length filter are exercised beyond GET.
+  for (const auto name : {"APPEND", "DEL", "HRANDFIELD", "MSETNX", "PFCOUNT", "SINTERCARD",
+                          "XAUTOCLAIM", "ZREMRANGEBYSCORE", "GEORADIUSBYMEMBER_RO"}) {
+    const std::string lowered = [&] {
+      std::string s{name};
+      for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      }
+      return s;
+    }();
+    const auto* upper = find_command(name);
+    const auto* lower = find_command(lowered);
+    REQUIRE(upper != nullptr);
+    CHECK(upper == lower);
+    CHECK(upper->name == name);
   }
 }
 
