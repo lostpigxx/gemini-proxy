@@ -1,8 +1,13 @@
 #include "io/task.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -138,4 +143,69 @@ TEST_CASE("frame pool falls back to operator new for oversized frames", "[io][ta
     co_return scratch[0] + scratch[4095];
   };
   CHECK(sync_wait(big()) == 3);
+}
+
+TEST_CASE("frame pool caps how much each bucket retains", "[io][task][frame_pool]") {
+  using vkp::io::detail::frame_pool;
+
+  // Driven through the raw API: the cap only trips when more frames of one
+  // size are live simultaneously than the bucket will keep, which coroutines
+  // in a test would make needlessly indirect.
+  constexpr std::size_t kSize = 300;  // one bucket, well under kMaxPooledSize
+  constexpr std::size_t kCount = frame_pool::kMaxFreePerBucket * 2;
+
+  std::vector<void*> blocks;
+  blocks.reserve(kCount);
+  for (std::size_t i = 0; i < kCount; ++i) {
+    void* p = frame_pool::allocate(kSize);
+    std::memset(p, 0xab, kSize);  // the payload must be usable past the header
+    blocks.push_back(p);
+  }
+  for (void* p : blocks) {  // all live at once, so none was served from a list
+    frame_pool::deallocate(p);
+  }
+
+  // Exactly kMaxFreePerBucket survived the release; the rest went back to
+  // ::operator delete and have to be allocated fresh again.
+  const auto before = frame_pool::thread_stats();
+  blocks.clear();
+  for (std::size_t i = 0; i < kCount; ++i) {
+    blocks.push_back(frame_pool::allocate(kSize));
+  }
+  const auto after = frame_pool::thread_stats();
+  CHECK(after.reused - before.reused == frame_pool::kMaxFreePerBucket);
+  CHECK(after.fresh - before.fresh == kCount - frame_pool::kMaxFreePerBucket);
+
+  for (void* p : blocks) {
+    frame_pool::deallocate(p);
+  }
+}
+
+TEST_CASE("frame pool is per-thread and reaped at thread exit", "[io][task][frame_pool]") {
+  using vkp::io::detail::frame_pool;
+
+  // The pool backs a shared-nothing runtime, so a frame must never migrate
+  // between threads' freelists. This thread's pool is already warm by now; a
+  // fresh thread must not see any of it.
+  frame_pool::stats on_entry{};
+  std::uint64_t reused_after_release = 0;
+  std::thread t([&] {
+    on_entry = frame_pool::thread_stats();
+
+    frame_pool::deallocate(frame_pool::allocate(128));
+    const auto before = frame_pool::thread_stats();
+    void* again = frame_pool::allocate(128);
+    reused_after_release = frame_pool::thread_stats().reused - before.reused;
+    frame_pool::deallocate(again);
+
+    // Deliberately left sitting on this thread's freelists at exit: the
+    // reaper has to free them, which LeakSanitizer checks for us.
+    frame_pool::deallocate(frame_pool::allocate(256));
+    frame_pool::deallocate(frame_pool::allocate(1024));
+  });
+  t.join();
+
+  CHECK(on_entry.fresh == 0);
+  CHECK(on_entry.reused == 0);
+  CHECK(reused_after_release == 1);  // its own release, not this thread's
 }

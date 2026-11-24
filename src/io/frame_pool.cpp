@@ -1,25 +1,29 @@
 #include "io/frame_pool.hpp"
 
-#include <array>
 #include <new>
 
 namespace vkp::io::detail {
 
 namespace {
 
-struct free_node {
-  free_node* next;
-};
+// Thread-exit cleanup, split out of `pool_state` on purpose. Giving
+// `pool_state` itself a destructor costs a `__cxa_thread_atexit` guard — a
+// load and a branch — on *every* access to the TLS object, twice per
+// `allocate`. This object carries the destructor instead and is touched only
+// from the cold path, so the hot path reaches the freelists with a bare
+// `tpidr_el0 + offset`.
+//
+// `armed` is not decoration: a bare `(void)&g_reaper;` may be elided, and the
+// thread_local would then never be registered for destruction. A store the
+// destructor observably reads cannot be.
+struct pool_reaper {
+  bool armed = false;
 
-// Header tag: 0 = unpooled (size exceeded kMaxPooledSize), otherwise
-// bucket index + 1.
-struct pool_state {
-  std::array<free_node*, frame_pool::kBucketCount> heads{};
-  std::array<std::size_t, frame_pool::kBucketCount> counts{};
-  frame_pool::stats stats{};
-
-  ~pool_state() {
-    for (free_node* node : heads) {
+  ~pool_reaper() {
+    if (!armed) {
+      return;
+    }
+    for (free_node* node : g_pool.heads) {
       while (node != nullptr) {
         free_node* next = node->next;
         ::operator delete(node);
@@ -29,55 +33,26 @@ struct pool_state {
   }
 };
 
-thread_local pool_state g_pool;
-
-std::size_t* header_of(void* frame) noexcept {
-  return reinterpret_cast<std::size_t*>(static_cast<char*>(frame) - frame_pool::kHeaderSize);
-}
+thread_local pool_reaper g_reaper;
 
 }  // namespace
 
-void* frame_pool::allocate(std::size_t n) {
-  const std::size_t total = n + kHeaderSize;
-  if (total > kMaxPooledSize) {
-    void* raw = ::operator new(total);
-    *static_cast<std::size_t*>(raw) = 0;
-    return static_cast<char*>(raw) + kHeaderSize;
-  }
-
-  const std::size_t bucket = (total + kGranularity - 1) / kGranularity - 1;
-  if (free_node* node = g_pool.heads[bucket]; node != nullptr) {
-    g_pool.heads[bucket] = node->next;
-    --g_pool.counts[bucket];
-    ++g_pool.stats.reused;
-    void* raw = node;
-    *static_cast<std::size_t*>(raw) = bucket + 1;
-    return static_cast<char*>(raw) + kHeaderSize;
-  }
-
-  void* raw = ::operator new((bucket + 1) * kGranularity);
+void* allocate_fresh(std::size_t bucket) {
+  g_reaper.armed = true;
+  void* raw = ::operator new((bucket + 1) * frame_pool::kGranularity);
   ++g_pool.stats.fresh;
   *static_cast<std::size_t*>(raw) = bucket + 1;
-  return static_cast<char*>(raw) + kHeaderSize;
+  return static_cast<char*>(raw) + frame_pool::kHeaderSize;
 }
 
-void frame_pool::deallocate(void* p) noexcept {
-  void* raw = static_cast<char*>(p) - kHeaderSize;
-  const std::size_t tag = *header_of(p);
-  if (tag == 0) {
-    ::operator delete(raw);
-    return;
-  }
+void* allocate_unpooled(std::size_t total) {
+  void* raw = ::operator new(total);
+  *static_cast<std::size_t*>(raw) = 0;
+  return static_cast<char*>(raw) + frame_pool::kHeaderSize;
+}
 
-  const std::size_t bucket = tag - 1;
-  if (g_pool.counts[bucket] >= kMaxFreePerBucket) {
-    ::operator delete(raw);
-    return;
-  }
-  auto* node = static_cast<free_node*>(raw);
-  node->next = g_pool.heads[bucket];
-  g_pool.heads[bucket] = node;
-  ++g_pool.counts[bucket];
+void free_block(void* raw) noexcept {
+  ::operator delete(raw);
 }
 
 frame_pool::stats frame_pool::thread_stats() noexcept {
