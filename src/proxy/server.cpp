@@ -470,23 +470,40 @@ class client_conn final : public reply_sink {
       if (close_if_idle()) {
         co_return;  // drain started while we were busy; this is the boundary
       }
-      const frame_result fr = co_await read_frame(loop_, fd_.get(), in, parser, &recv_slot_);
+      // Inline parse/recv loop rather than a child coroutine: a pipelined recv
+      // carries many requests, and a per-frame child task would allocate,
+      // symmetric-transfer, and destroy a frame for each one.
+      std::size_t frame_len = 0;
+      for (;;) {
+        if (in.readable_bytes() > 0) {
+          const resp::parse_status st = parser.parse(in.readable());
+          if (st == resp::parse_status::complete) {
+            frame_len = parser.message().raw.size();
+            break;
+          }
+          if (st == resp::parse_status::protocol_error) {
+            at_frame_boundary_ = false;
+            stats_.bump_error(metrics::error_kind::protocol);
+            reply_now(fmt::format("-ERR Protocol error: {}\r\n", resp::to_string(parser.error())));
+            co_return;
+          }
+        }
+        const std::span<char> w = in.prepare(4096);
+        const std::int32_t n = co_await loop_.async_recv(fd_.get(), w, &recv_slot_);
+        at_frame_boundary_ = false;
+        if (n <= 0 || aborting_) {
+          co_return;  // eof / io error / cancelled / aborting
+        }
+        in.commit(static_cast<std::size_t>(n));
+      }
       at_frame_boundary_ = false;
       if (aborting_) {
         co_return;
       }
-      if (fr.k == frame_result::kind::protocol_error) {
-        stats_.bump_error(metrics::error_kind::protocol);
-        reply_now(fmt::format("-ERR Protocol error: {}\r\n", resp::to_string(fr.perr)));
-        co_return;
-      }
-      if (fr.k != frame_result::kind::frame) {
-        co_return;  // eof / io error / cancelled
-      }
       // Request frame bytes, not socket bytes: pipelined batches are already
       // covered and the number stays comparable with vkp_requests_total. A
       // frame that never parses is counted as an error instead.
-      stats_.bump_bytes(metrics::byte_dir::in, fr.len);
+      stats_.bump_bytes(metrics::byte_dir::in, frame_len);
 
       const resp::message_view& msg = parser.message();
       if (!msg.is_command) {
@@ -547,7 +564,7 @@ class client_conn final : public reply_sink {
           co_return;
         }
       }
-      in.consume(fr.len);  // enqueue_forward copied the bytes
+      in.consume(frame_len);  // enqueue_forward copied the bytes
       if (close_after) {
         co_return;
       }
@@ -577,7 +594,17 @@ class client_conn final : public reply_sink {
       }
       writer_sending_ = true;
       const std::string_view batch = out_.begin_send();
-      const std::int32_t r = co_await io::send_all(loop_, fd_.get(), batch, &send_slot_);
+      std::int32_t r = 0;
+      std::size_t off = 0;
+      while (off < batch.size()) {
+        const std::int32_t n = co_await loop_.async_send(
+            fd_.get(), {batch.data() + off, batch.size() - off}, &send_slot_);
+        if (n <= 0) {
+          r = n < 0 ? n : -EIO;
+          break;
+        }
+        off += static_cast<std::size_t>(n);
+      }
       out_.end_send();
       writer_sending_ = false;
       send_slot_.reset();

@@ -6,9 +6,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
+#include <cstddef>
 #include <sys/socket.h>
 #include <system_error>
-#include <unordered_set>
 
 #include <liburing.h>
 
@@ -63,12 +63,14 @@ class uring_backend final : public backend {
         break;
     }
     io_uring_sqe_set_data(sqe, &op);
-    inflight_.insert(&op);
+    assert(!op.in_backend);
+    op.in_backend = true;
+    ++pending_;
     // No io_uring_submit here: poll() flushes the whole batch in one syscall.
   }
 
   bool cancel(operation& op, ready_queue& /*ready*/) override {
-    if (!inflight_.contains(&op)) {
+    if (!op.in_backend) {
       return false;
     }
     // Asynchronous: the op's own CQE (usually -ECANCELED; a real result wins
@@ -84,7 +86,7 @@ class uring_backend final : public backend {
   }
 
   void cancel_all(ready_queue& /*ready*/) override {
-    if (inflight_.empty()) {
+    if (pending_ == 0) {
       return;
     }
     io_uring_sqe* sqe = get_sqe();
@@ -120,14 +122,16 @@ class uring_backend final : public backend {
       if (op == nullptr) {
         continue;  // completion of a cancel SQE
       }
-      inflight_.erase(op);
+      assert(op->in_backend && pending_ > 0);
+      op->in_backend = false;
+      --pending_;
       op->result = cqe->res;
       ready.push(*op);
     }
     io_uring_cq_advance(&ring_, count);
   }
 
-  [[nodiscard]] std::size_t pending() const noexcept override { return inflight_.size(); }
+  [[nodiscard]] std::size_t pending() const noexcept override { return pending_; }
 
  private:
   io_uring_sqe* get_sqe() {
@@ -140,7 +144,7 @@ class uring_backend final : public backend {
   }
 
   io_uring ring_{};
-  std::unordered_set<operation*> inflight_;
+  std::size_t pending_ = 0;
 };
 
 }  // namespace

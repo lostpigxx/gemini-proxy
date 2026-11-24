@@ -20,32 +20,6 @@ constexpr std::string_view kHealthPing = "*1\r\n$4\r\nPING\r\n";
 
 }  // namespace
 
-io::task<frame_result> read_frame(io::event_loop& loop, int fd, read_buffer& buf,
-                                  resp::parser& parser, io::cancel_slot* slot) {
-  for (;;) {
-    if (buf.readable_bytes() > 0) {
-      switch (parser.parse(buf.readable())) {
-        case resp::parse_status::complete:
-          co_return frame_result{.k = frame_result::kind::frame,
-                                 .len = parser.message().raw.size()};
-        case resp::parse_status::protocol_error:
-          co_return frame_result{.k = frame_result::kind::protocol_error, .perr = parser.error()};
-        case resp::parse_status::need_more:
-          break;
-      }
-    }
-    const std::span<char> w = buf.prepare(4096);
-    const std::int32_t n = co_await loop.async_recv(fd, w, slot);
-    if (n == 0) {
-      co_return frame_result{.k = frame_result::kind::eof};
-    }
-    if (n < 0) {
-      co_return frame_result{.k = frame_result::kind::io_error, .err = n};
-    }
-    buf.commit(static_cast<std::size_t>(n));
-  }
-}
-
 backend_conn::backend_conn(io::event_loop& loop, const io::resolved_addr& addr,
                            const backend_conn_config& cfg, metrics::worker_stats& stats)
     : loop_(loop),
@@ -190,32 +164,40 @@ io::task<bool> backend_conn::backoff_wait() {
 }
 
 io::task<void> backend_conn::read_responses() {
+  // Inline parse/recv loop rather than a child coroutine: under pipelining
+  // dozens of responses land in one recv, and a per-frame child task would
+  // allocate, symmetric-transfer, and destroy a frame for every single reply.
   for (;;) {
-    const frame_result r = co_await read_frame(loop_, fd_.get(), in_, parser_, &recv_slot_);
-    if (r.k != frame_result::kind::frame) {
-      // This is the one place that knows *why* a session ended; the driver
-      // above only sees that it did. -ECANCELED is our own doing (timeout
-      // kill or drain) and the caller already logs those, hence debug.
-      switch (r.k) {
-        case frame_result::kind::eof:
-          VKP_LOG_INFO("backend {backend}: closed the connection, {inflight} request(s) in flight",
-                       io::to_string(addr_), inflight_.size());
+    std::size_t frame_len = 0;
+    for (;;) {
+      if (in_.readable_bytes() > 0) {
+        const resp::parse_status st = parser_.parse(in_.readable());
+        if (st == resp::parse_status::complete) {
+          frame_len = parser_.message().raw.size();
           break;
-        case frame_result::kind::io_error:
-          if (r.err == -ECANCELED) {
-            VKP_LOG_DEBUG("backend {backend}: read cancelled", io::to_string(addr_));
-          } else {
-            VKP_LOG_WARN("backend {backend}: read failed: {error}", io::to_string(addr_),
-                         std::strerror(-r.err));
-          }
-          break;
-        case frame_result::kind::protocol_error:
+        }
+        if (st == resp::parse_status::protocol_error) {
           VKP_LOG_WARN("backend {backend}: malformed response frame", io::to_string(addr_));
-          break;
-        case frame_result::kind::frame:
-          break;  // unreachable
+          co_return;
+        }
       }
-      co_return;
+      const std::span<char> w = in_.prepare(4096);
+      const std::int32_t n = co_await loop_.async_recv(fd_.get(), w, &recv_slot_);
+      if (n == 0) {
+        VKP_LOG_INFO("backend {backend}: closed the connection, {inflight} request(s) in flight",
+                     io::to_string(addr_), inflight_.size());
+        co_return;
+      }
+      if (n < 0) {
+        if (n == -ECANCELED) {
+          VKP_LOG_DEBUG("backend {backend}: read cancelled", io::to_string(addr_));
+        } else {
+          VKP_LOG_WARN("backend {backend}: read failed: {error}", io::to_string(addr_),
+                       std::strerror(-n));
+        }
+        co_return;
+      }
+      in_.commit(static_cast<std::size_t>(n));
     }
     if (inflight_.empty()) {
       // Not a transport hiccup: the backend sent a frame we never asked for,
@@ -224,8 +206,8 @@ io::task<void> backend_conn::read_responses() {
                    io::to_string(addr_));
       co_return;
     }
-    deliver_head(in_.readable().substr(0, r.len));
-    in_.consume(r.len);
+    deliver_head(in_.readable().substr(0, frame_len));
+    in_.consume(frame_len);
   }
 }
 
@@ -337,7 +319,17 @@ io::task<void> backend_conn::writer() {
     }
     writer_sending_ = true;
     const std::string_view batch = out_.begin_send();
-    const std::int32_t r = co_await io::send_all(loop_, fd_.get(), batch, &send_slot_);
+    std::int32_t r = 0;
+    std::size_t off = 0;
+    while (off < batch.size()) {
+      const std::int32_t n = co_await loop_.async_send(
+          fd_.get(), {batch.data() + off, batch.size() - off}, &send_slot_);
+      if (n <= 0) {
+        r = n < 0 ? n : -EIO;
+        break;
+      }
+      off += static_cast<std::size_t>(n);
+    }
     out_.end_send();
     writer_sending_ = false;
     send_slot_.reset();

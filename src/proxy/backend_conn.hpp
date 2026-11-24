@@ -51,20 +51,6 @@ struct backend_conn_config {
   std::chrono::milliseconds backoff_max{2000};
 };
 
-// Reads until one complete RESP frame sits at the front of `buf`; shared by
-// the client reader and the backend driver.
-struct frame_result {
-  enum class kind : std::uint8_t { frame, eof, io_error, protocol_error };
-  kind k = kind::frame;
-  std::size_t len = 0;                             // frame bytes at the buffer front
-  std::int32_t err = 0;                            // -errno for io_error
-  resp::parse_errc perr = resp::parse_errc::none;  // for protocol_error
-};
-
-[[nodiscard]] io::task<frame_result> read_frame(io::event_loop& loop, int fd, read_buffer& buf,
-                                                resp::parser& parser,
-                                                io::cancel_slot* slot = nullptr);
-
 // Single-threaded; owned by the worker's server. Lifecycle: construct →
 // start() → (begin_drain() → finished()) → destroy after the loop ran dry.
 class backend_conn {

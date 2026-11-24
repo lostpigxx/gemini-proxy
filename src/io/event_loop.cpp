@@ -82,7 +82,8 @@ void event_loop::submit(operation& op, cancel_slot* slot) {
       ready_.push(op);
       break;
     case opcode::timeout:
-      timers_.push_back({std::chrono::steady_clock::now() + op.duration, &op});
+      now_ = std::chrono::steady_clock::now();
+      timers_.push_back({now_ + op.duration, &op});
       std::push_heap(timers_.begin(), timers_.end());
       break;
     default:
@@ -114,9 +115,16 @@ void event_loop::cancel_op(operation& op) noexcept {
 }
 
 std::optional<std::chrono::nanoseconds> event_loop::expire_timers() {
-  // Deliberately the real clock, not now_: this runs after the ready-queue
-  // drain, and judging deadlines against a value taken before it would fire
-  // every timer late by the length of the drain.
+  if (timers_.empty()) {
+    return std::nullopt;
+  }
+  // Skip the second clock_gettime per iteration when the earliest timer is
+  // still well in the future (e.g. the backend watchdog sitting ~1 s out).
+  // `now_` was just refreshed after poll() or on the last timeout submit;
+  // once a timer enters the final millisecond we switch back to a live read.
+  if (timers_.front().deadline > now_ + std::chrono::milliseconds{1}) {
+    return timers_.front().deadline - now_;
+  }
   const auto now = std::chrono::steady_clock::now();
   now_ = now;
   while (!timers_.empty() && timers_.front().deadline <= now) {
@@ -133,13 +141,8 @@ std::optional<std::chrono::nanoseconds> event_loop::expire_timers() {
 }
 
 void event_loop::run() {
+  now_ = std::chrono::steady_clock::now();
   for (;;) {
-    // Before anything resumes, not after: poll() below can block for as long
-    // as the next timer allows, and every coroutine woken by this drain reads
-    // now() for its latency accounting. The pair of reads per iteration
-    // amortises over the whole completion batch — the point is to keep the
-    // per-request count at zero.
-    now_ = std::chrono::steady_clock::now();
     while (operation* op = ready_.pop()) {
       op->continuation.resume();
     }
@@ -157,6 +160,9 @@ void event_loop::run() {
       break;  // nothing can ever complete again
     }
     backend_->poll(next_deadline, ready_);
+    // Refresh once right after poll() returns (the only blocking step in the
+    // loop), before resuming the completion batch.
+    now_ = std::chrono::steady_clock::now();
   }
 }
 

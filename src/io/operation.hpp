@@ -24,6 +24,7 @@ enum class opcode : std::uint8_t {
 // completion and backends/queues store raw pointers to it.
 struct operation {
   opcode op = opcode::nop;
+  bool in_backend = false;  // tracked by backends (e.g. io_uring) to avoid a heap set per op
   int fd = -1;
   char* rbuf = nullptr;        // recv destination
   const char* wbuf = nullptr;  // send source
