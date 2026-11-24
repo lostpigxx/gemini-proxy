@@ -21,7 +21,7 @@
 | M3 | 多线程 + 连接池 + pipelining | 可承受多连接压测的生产形态骨架 | ✅ 完成（2026-09-07） |
 | M4 | cluster 路由 | 对接 valkey cluster，处理 MOVED/ASK | ✅ 完成（2026-09-10） |
 | M5 | 可观测性与配置 | metrics / 日志 / 配置 / 优雅关闭 | ✅ 完成（2026-09-17） |
-| M6 | 性能打磨 | 基线固化与针对性优化 | |
+| M6 | 性能打磨 | 基线固化与针对性优化 | ✅ 完成（2026-11-24） |
 
 依赖关系：M1 与 M2 可部分并行（M1 不依赖任何 IO 代码）；其余按序进行。
 
@@ -569,7 +569,9 @@
 
 ---
 
-## M6 — 性能打磨
+## M6 — 性能打磨 ✅
+
+**状态**：已完成（2026-11-24）。设计记录与全部逐项 A/B 数据见 [docs/design/m6-performance.md](design/m6-performance.md)。
 
 **目标**：用数据驱动优化，逼近直连性能。
 
@@ -601,11 +603,32 @@
    - cluster 模式另立一档：M4 实测 `-P 16` 为 standalone 的 57~58%，目标
      **≥ 80%**（同一轮内纵向对比，不与直连比）。
 
-**验收标准**：报告展示每项优化的前后对比；最终数字写入 README。
+**验收标准**：报告展示每项优化的前后对比；最终数字写入 README。**两项均达成**，详见 [docs/design/m6-performance.md](design/m6-performance.md) 与 [README.md](../README.md)。
+
+**实施记录（与计划的偏差与实测汇总）**：
+
+- **先修仪器再优化**（[m6-performance.md](design/m6-performance.md) §1~§2）：固化 `scripts/bench-env.sh` + `scripts/bench.sh`，解决了 GET 命中率导致 2.6× 双峰、250 ms tick 量化、`--cpu-affinity` 静默失效、残留进程被 `SO_REUSEPORT` 混流、`/proc/pid/stat` 100 Hz tick 采样误差等 7 个测量陷阱。验收主指标由「相对直连吞吐比」（受后端与闭环客户端饱和干扰，不单调）修正为 `schedstat` 测得的 **proxy CPU µs/请求**，每项改动均以「改前 / 改后 / 同二进制对照」三臂同轮交替 A/B 判优。
+- **落地并验证生效的五批优化**（均通过五条 Linux 构建/sanitizer 矩阵、129/129 单测；涉及解析器的变更均过 60s libFuzzer 零分歧）：
+  1. `backend_conn` 每请求时钟改用 `event_loop::now()` 缓存（`b903b6c`）：`-P 16` 省 **4.1~5.4%** 总 CPU。
+  2. `resp::parse_i64` 纯数字快路径 + `find_command` 编译期首字母区间与长度过滤（`21c80ea`）：`-P 16` 单机省 **0.9~3.0%**、集群省 **0.9~1.8%**。
+  3. `frame_pool` 热路径内联到头文件 + 拆分冷路径 TLS `pool_reaper`（`6c0ae70`）：`-P 16` 单机省 **2.0~2.5%**、集群省 **1.2~1.3%**。
+  4. 消除热路径 `read_frame`/`send_all` 每帧/每批子协程 + `uring_backend` 内嵌标记替代 `unordered_set` + `event_loop::expire_timers` 消除冗余 `clock_gettime`（`16903e2`）：`-P 16` 单机省 **7.1~7.7%**、集群省 **2.9%**。
+  5. RESP 解析器常见整帧直通快路径（`7b15947`，`vkp_resp_bench` 提速 **1.68×~2.91×**，331 万次 fuzz 零分歧）：`-P 16` 单机再省 **7.3~7.9%**、集群再省 **3.4~3.9%**。
+- **经实测否决/推迟的三项候选**：
+  - `client_conn` slot 缓冲复用：A/B 落在 ±1% 噪声内，已回滚（§6）。
+  - 「恢复集群模式丢失的写合并」：`ss -tin` 实测写合并一直在做（单机 44.4 请求/段，集群 12.6 请求/段正好是三节点均分，跨连接无法合并），内核增量来自环回下 4.06× TCP 分段数，且环回把接收端 TCP 处理计在 proxy 头上（真实网络更小）（§8）。
+  - `provided buffer ring` + `multishot recv/accept`：批量 submit 已达 27~53 请求/`io_uring_enter`，`liburing` 总开销 <0.6% CPU，复杂度收益比不成立，转入 Backlog（§12）。
+- **终版累积对比**（M5 终点 `0243eeb` vs M6 终版 `7b15947`，5 轮同轮交替中位数，4 worker，Linux arm64 / OrbStack）：
+  - 单机 `-P 16`：CPU/req 降 **22.7%（SET，0.4543 → 0.3510 µs）** / **18.1%（GET，0.4300 → 0.3522 µs）**；p99 0.567~0.599 ms（低于直连 0.623~0.663 ms），吞吐 1.54~1.66M rps（直连 1.43~1.54M）。
+  - 单机 `-P 1`（c=200）：CPU/req 降 **5.2~5.5%**，吞吐 584k rps（直连 453k，+29%），p99 0.487~0.511 ms（直连 0.663~0.671 ms）。
+  - 集群 `-P 16`（3 主）：CPU/req 降 **11.6%（SET，1.0277 → 0.9080 µs）** / **10.3%（GET，1.0105 → 0.9063 µs）**，吞吐 2.49M rps，p99 0.423~0.447 ms。
+  - `epoll` 路径未退化，随共享优化同步降 **15~18%（单机 `-P 16`）** 与 **10~11%（集群 `-P 16`）**。
 
 ---
 
 ## Backlog（有意识推迟，不排期）
+
+- `provided buffer ring` + `multishot recv/accept` / `recv bundle`（M6 实测单发批提交已达 27~53 req/syscall，待高并发万级连接真实跨机场景再评估）
 
 - `SUBSCRIBE`/`PSUBSCRIBE`（RESP3 push 转发，连接粘性）
 - `MULTI/EXEC`（同 slot 事务透传）、`WATCH`
