@@ -261,8 +261,9 @@ CPU/请求为 7 轮中位数。集群为 3 主 0 从，各占一核。
    2.38%）不是重点。能动内核时间的只有"减少后端方向的 socket 操作次数或包数"。这是 M6 里
    最有价值也最难的一项，需要单独一页设计。~~ **已查清并否决，见 §8**：包数确实是 4.06 倍，
    但合并已经在做了，小是因为被三条连接除了，跨连接无法合并。
-5. **provided buffer ring + multishot recv/accept、recv bundle**——降级至此，理由见 §3.2。
-   若要做，仍须 ring 与 multishot 成对做（M2 交接结论）。
+5. ~~**provided buffer ring + multishot recv/accept、recv bundle**——降级至此，理由见 §3.2。
+   若要做，仍须 ring 与 multishot 成对做（M2 交接结论）。~~ **已评估并推迟，见 §12**：
+   `liburing` 仅占总 CPU <0.6%，27~53 请求/syscall 下不足以摊回第二套缓冲所有权模型的复杂度。
 
 `-P 1` 工况（用户态 3~5%）对 1、2、3 基本免疫，这几项的收益只体现在高 pipeline 深度下。
 
@@ -453,7 +454,57 @@ CPU/请求"是**环回工况下的上界**，真实部署会小于它。README �
 
 单机净省 **5.3~5.8%** 总 CPU，集群净省 **2.9~3.5%** 总 CPU（集群 GET 中位吞吐也由 2.495M 提至 2.851M rps），与 `perf` 中三项合计 12~14% 用户态占比 × 30~34% 用户态比重的预期完全吻合。
 
-## 11. 与开发计划的偏差汇总
+## 11. 已实施：RESP 解析器常见整帧直通快路径
+
+Batch F 之后，`resp::parser`（`parse` + `dispatch_header` + `finish` + `libc memchr`）成为剩余最大的用户态热点（占单机用户态近四成）。逐帧拆解其开销来自三处：(1) 每行 `*2\r\n`/`$3\r\n`/`+OK\r\n` 都经 PLT 调一次 `libc memchr`；(2) 每条命令先写入 `arg_positions_` 再在 `finish()` 里二遍物化为 `arg_views_`；(3) 每条完整帧入口都 `reset()` 三个向量并压栈/弹栈。
+
+### 改动
+
+在 `parser::parse()` 入口（仅当 `state_ == done` 或 `state_ == header && pos_ == 0`）增加 `try_fast_parse()`（`src/resp/parser.cpp`），针对完整躺在缓冲里的四种高频形态单遍直通：
+
+- **命令数组**（`*N\r\n$len\r\n...`）：内联解析无符号十进制长度（≤18 位）、一次校验 `max_nesting_depth`/`max_line_bytes`/`max_bulk_bytes`/`max_message_bytes`/`max_command_args` 与最小字节下界 `count <= (size - p) / 5`，直接写入 `arg_views_`（零 `stack_`、零 `arg_positions_`、零 `memchr`）。
+- **单 bulk 回复**（`$len\r\n...\r\n` 与 `$-1\r\n`）：覆盖全部 GET 命中与未命中。
+- **短 simple string/error**（`+`/`-`，前 64 字节内联扫 `\n`）与 **非负整数回复**（`:`）：覆盖 `+OK`、`+PONG`、错误与计数回复。
+
+任何截断、非法字符、超限或非常规形态都直接返回 `false`，零副作用落回既有增量状态机；这样边界语义与错误码仍有唯一归属者。
+
+### 验证与微基准
+
+- **libFuzzer 交叉验证**：`resp_parser_fuzz` 60 秒跑完 **331 万次执行**（ASan+UBSan，589 edges / 3812 features），「一次性快路径 / 任意分块增量慢路径 / 深解析器」零分歧、零 crash、零泄漏。
+- **`vkp_resp_bench` 微基准**（Linux arm64，clang-18 Release + mimalloc）：
+
+| 报文 | 改前 | 改后 | 倍数 |
+|---|---|---|---|
+| GET (39 B) | 2.08 GB/s | **3.81 GB/s** | **1.83×** |
+| SET 64B (110 B) | 4.48 GB/s | **8.85 GB/s** | **1.98×** |
+| SET 1KiB (1072 B) | 44.02 GB/s | **83.03 GB/s** | **1.89×** |
+| MGET 10 keys (275 B) | 3.55 GB/s | **7.42 GB/s** | **2.09×** |
+| MGET 100 keys (2616 B) | 2.86 GB/s | **8.31 GB/s** | **2.91×** |
+| bulk reply 1KiB (1033 B) | 139.64 GB/s | **234.58 GB/s** | **1.68×** |
+
+### A/B 结果
+
+`-P 16`，同轮交替，7 轮取中位数，带同二进制对照 arm（改前 = `16903e2`）：
+
+| 场景 | 改前 | 改后 | 对照（改前的二进制） | 改后/改前 | 对照/改前 |
+|---|---|---|---|---|---|
+| 单机 SET P=16（7 轮） | 0.3933 | 0.3622 | 0.3828 | **92.1%** | 97.3% |
+| 单机 GET P=16（7 轮） | 0.3745 | 0.3473 | 0.3782 | **92.7%** | 101.0% |
+| 集群 SET P=16（7 轮） | 0.9406 | 0.9089 | 0.9353 | **96.6%** | 99.4% |
+| 集群 GET P=16（7 轮） | 0.9411 | 0.9048 | 0.9321 | **96.1%** | 99.0% |
+
+单机再降 **5~8%** 总 CPU，集群再降 **3~4%** 总 CPU。
+
+## 12. 已评估并推迟：provided buffer ring + multishot recv/accept
+
+M2 移交至 M6 的最后一项候选项。结合 §3.2、§8 与 Batch E~G 之后的剖面数据，结论是不在 M6 引入：
+
+1. **收益天花板极低**：§3.2 实测单机 27.2 请求/次 `io_uring_enter`、集群 53.1 请求/次；`perf` 中整个 `liburing` 仅占用户态 1.8~2.8%（折合总 CPU **0.5~0.9%**）。§8 进一步算平了内核账——环回下内核 CPU 几乎全部花在 TCP 分段处理（~4.5 µs/段），而非 SQE 提交或系统调用入口。
+2. **复杂度代价不对称**：`IORING_RECV_MULTISHOT` 强制配合 `IOSQE_BUFFER_SELECT`（buffer ring），而 `read_buffer` + `resp::parser` 的零拷贝不变量建立在「单块连续内存」之上；引入 buffer ring 要么在每次 recv 后额外拷贝回 `read_buffer`（抵消收益），要么把解析器与连接缓冲改成跨段模型，同时还只在 Linux 6.0+ io_uring 路径生效（epoll/kqueue 无法共享）。
+
+该项转入 Backlog，待未来真实跨机网络压测下若出现高连接数（数千~数万空闲/低频连接）导致单发 recv SQE 内存占用或提交成为瓶颈时再启用。
+
+## 13. 与开发计划的偏差汇总
 
 | 计划原文 | 实际 | 原因 |
 |---|---|---|

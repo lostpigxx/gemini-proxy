@@ -1,5 +1,6 @@
 #include "resp/parser.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <optional>
@@ -8,6 +9,41 @@
 namespace vkp::resp {
 
 namespace {
+
+// Parses a non-negative 1..18-digit decimal header line starting at
+// `data[p]` (whose type byte was already checked) and ending with CRLF.
+// Advances `p` past CRLF and stores the parsed value in `out`. Returns false
+// on truncation, >18 digits, malformed bytes, or any limit violation so the
+// caller falls back to the incremental state machine.
+bool parse_u64_line(const char* data, std::size_t size, std::size_t& p, std::size_t max_line_bytes,
+                    std::size_t max_message_bytes, std::uint64_t& out) noexcept {
+  const std::size_t line_start = p;
+  ++p;  // skip type byte
+  if (p >= size) {
+    return false;
+  }
+  const std::size_t digits_start = p;
+  const std::size_t max_end = std::min(size, digits_start + 19);
+  std::uint64_t v = 0;
+  while (p < max_end) {
+    const auto d = static_cast<unsigned>(static_cast<unsigned char>(data[p]) - '0');
+    if (d > 9) {
+      break;
+    }
+    v = (v * 10) + d;
+    ++p;
+  }
+  const std::size_t digits = p - digits_start;
+  if (digits == 0 || digits > 18 || p + 1 >= size || data[p] != '\r' || data[p + 1] != '\n') {
+    return false;
+  }
+  if (p - line_start > max_line_bytes || p + 2 > max_message_bytes) {
+    return false;
+  }
+  p += 2;
+  out = v;
+  return true;
+}
 
 // Strict int64 line: optional '-', digits, full consumption. RESP never uses
 // a leading '+' or whitespace in length/integer lines.
@@ -273,7 +309,124 @@ parse_status parser::finish(std::string_view window) {
   return parse_status::complete;
 }
 
+bool parser::try_fast_parse(std::string_view window) {
+  const char* data = window.data();
+  const std::size_t size = window.size();
+  const char type = data[0];
+
+  if (type == '*') {
+    if (limits_.max_nesting_depth == 0) {
+      return false;
+    }
+    std::size_t p = 0;
+    std::uint64_t count = 0;
+    if (!parse_u64_line(data, size, p, limits_.max_line_bytes, limits_.max_message_bytes, count)) {
+      return false;
+    }
+    // Each bulk argument takes at least 5 bytes ("$0\r\n\r\n"); bail out early
+    // on truncated or huge counts before looping or growing arg_views_.
+    if (count == 0 || count > limits_.max_command_args || count > (size - p) / 5) {
+      return false;
+    }
+    arg_views_.clear();
+    for (std::uint64_t i = 0; i < count; ++i) {
+      if (p >= size || data[p] != '$') {
+        return false;
+      }
+      std::uint64_t len = 0;
+      if (!parse_u64_line(data, size, p, limits_.max_line_bytes, limits_.max_message_bytes, len)) {
+        return false;
+      }
+      if (len > limits_.max_bulk_bytes || size - p < 2 || len > size - p - 2) {
+        return false;
+      }
+      const auto bulk_len = static_cast<std::size_t>(len);
+      if (p + bulk_len + 2 > limits_.max_message_bytes || data[p + bulk_len] != '\r' ||
+          data[p + bulk_len + 1] != '\n') {
+        return false;
+      }
+      arg_views_.emplace_back(data + p, bulk_len);
+      p += bulk_len + 2;
+    }
+    state_ = state::done;
+    message_.raw = std::string_view{data, p};
+    message_.is_command = true;
+    message_.args = arg_views_;
+    return true;
+  }
+
+  if (type == '$') {
+    if (size >= 5 && data[1] == '-' && data[2] == '1' && data[3] == '\r' && data[4] == '\n') {
+      if (3 > limits_.max_line_bytes || 5 > limits_.max_message_bytes) {
+        return false;
+      }
+      state_ = state::done;
+      message_.raw = std::string_view{data, 5};
+      message_.is_command = false;
+      message_.args = {};
+      return true;
+    }
+    std::size_t p = 0;
+    std::uint64_t len = 0;
+    if (!parse_u64_line(data, size, p, limits_.max_line_bytes, limits_.max_message_bytes, len)) {
+      return false;
+    }
+    if (len > limits_.max_bulk_bytes || size - p < 2 || len > size - p - 2) {
+      return false;
+    }
+    const auto bulk_len = static_cast<std::size_t>(len);
+    if (p + bulk_len + 2 > limits_.max_message_bytes || data[p + bulk_len] != '\r' ||
+        data[p + bulk_len + 1] != '\n') {
+      return false;
+    }
+    state_ = state::done;
+    message_.raw = std::string_view{data, p + bulk_len + 2};
+    message_.is_command = false;
+    message_.args = {};
+    return true;
+  }
+
+  if (type == '+' || type == '-') {
+    const std::size_t scan_limit = std::min<std::size_t>(size, 64);
+    for (std::size_t i = 1; i < scan_limit; ++i) {
+      if (data[i] == '\n') {
+        if (data[i - 1] != '\r' || (i - 1) > limits_.max_line_bytes ||
+            (i + 1) > limits_.max_message_bytes) {
+          return false;
+        }
+        state_ = state::done;
+        message_.raw = std::string_view{data, i + 1};
+        message_.is_command = false;
+        message_.args = {};
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (type == ':') {
+    std::size_t p = 0;
+    std::uint64_t ignored = 0;
+    if (!parse_u64_line(data, size, p, limits_.max_line_bytes, limits_.max_message_bytes,
+                        ignored)) {
+      return false;
+    }
+    state_ = state::done;
+    message_.raw = std::string_view{data, p};
+    message_.is_command = false;
+    message_.args = {};
+    return true;
+  }
+
+  return false;
+}
+
 parse_status parser::parse(std::string_view window) {
+  if ((state_ == state::done || (state_ == state::header && pos_ == 0)) && !window.empty()) {
+    if (try_fast_parse(window)) {
+      return parse_status::complete;
+    }
+  }
   if (state_ == state::done) {
     reset();
   }

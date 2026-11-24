@@ -81,6 +81,10 @@ class parser {
   };
 
   parse_status fail(parse_errc e) noexcept;
+  // Whole-frame fast path for common complete frames (commands, bulk/simple/int
+  // replies); returns false on any truncation or edge case so the incremental
+  // state machine remains the sole owner of partial/malformed inputs.
+  [[nodiscard]] bool try_fast_parse(std::string_view window);
   [[nodiscard]] parse_status dispatch_header(std::string_view window, std::size_t line_end);
   // Returns true when the whole message is complete.
   [[nodiscard]] bool on_value_complete();
